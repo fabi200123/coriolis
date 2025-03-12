@@ -572,3 +572,266 @@ class BaseLinuxOSMorphingTools(BaseOSMorphingTools):
         self._set_grub2_cmdline(config_obj, options)
         self._apply_grub2_config(
             config_obj, execute_update_grub)
+
+    def _add_net_udev_rules(self, net_ifaces_info):
+        udev_file = "etc/udev/rules.d/70-persistent-net.rules"
+        if not self._test_path(udev_file):
+            if net_ifaces_info:
+                content = utils.get_udev_net_rules(net_ifaces_info)
+                self._write_file_sudo(udev_file, content)
+
+    def _get_netplan_info(self, netplan_base_path, nics_info):
+        interfaces = dict()
+        mac_addresses = [nic.get('mac_address') for nic in nics_info]
+        netplan_cfgs = [n for n in self._list_dir(netplan_base_path)
+                        if n.endswith(".yaml") or n.endswith(".yml")]
+        for cfg in netplan_cfgs:
+            cfg_path = "%s/%s" % (netplan_base_path, cfg)
+            try:
+                contents = yaml.safe_load(self._read_file(cfg_path).decode())
+                ifaces = contents.get('network', {}).get('ethernets', {})
+                for iface, net_cfg in ifaces.items():
+                    mac_address = net_cfg.get('match', {}).get('macaddress')
+                    ip_addresses = []
+                    for ip in net_cfg.get('addresses', []):
+                        if isinstance(ip, dict):
+                            ip_keys = list(ip.keys())
+                            if not ip_keys:
+                                LOG.warning(
+                                    "Found empty IP address object entry. "
+                                    "Skipping")
+                                continue
+                            ip_addresses.append(ip[ip_keys[0]])
+                        else:
+                            ip_addresses.append(ip.split('/')[0])
+                    if mac_address:
+                        if mac_address not in mac_addresses:
+                            LOG.warn(
+                                "Found MAC address %s for interface '%s' is "
+                                "not one of the MAC addresses fetched by "
+                                "Coriolis for this instance: %s",
+                                mac_address, iface, mac_addresses)
+                        interfaces[iface] = mac_address
+                    elif ip_addresses:
+                        for nic in nics_info:
+                            nic_ip_addresses = nic.get('ip_addresses')
+                            for ip in nic_ip_addresses:
+                                if ip in ip_addresses:
+                                    interfaces[iface] = nic.get('mac_address')
+                                    break
+                        if not interfaces.get(iface):
+                            LOG.warn(
+                                "Could not find IP address '%s' for interface "
+                                "'%s' in Coriolis NICs: %s",
+                                ip_addresses, iface, nics_info)
+                    else:
+                        LOG.warn(
+                            "Could not find MAC address or IP addresses for "
+                            "interface '%s' in netplan configuration '%s'",
+                            iface, cfg_path)
+            except yaml.YAMLError:
+                LOG.warn(
+                    "Could not parse netplan configuration '%s'. Invalid YAML "
+                    "file: %s", cfg_path, utils.get_exception_details())
+
+        return interfaces
+
+    def _get_interfaces_info(self, interfaces_path, mac_addresses):
+        interfaces = dict()
+        paths = [interfaces_path]
+
+        def _parse_iface_file(interface_file, nics_info):
+            nonlocal interfaces
+            nonlocal paths
+            curr_iface = None
+            curr_mac_address = None
+            curr_ip_address = None
+            mac_addresses = [nic.get('mac_address') for nic in nics_info]
+            interfaces_contents = self._read_file(interface_file).decode()
+            LOG.debug(
+                "Fetched %s contents: %s", interface_file, interfaces_contents)
+            for line in interfaces_contents.splitlines():
+                if line.strip().startswith("iface"):
+                    words = line.split()
+                    if len(words) > 1:
+                        curr_iface = words[1]
+                elif line.strip().startswith("hwaddress ether"):
+                    words = line.split()
+                    if len(words) > 2:
+                        if not curr_iface:
+                            LOG.warn("Found MAC address %s does not belong to "
+                                     "any interface stanza. Skipping.",
+                                     words[2])
+                            continue
+
+                        curr_mac_address = words[2]
+                        if curr_mac_address.lower() not in mac_addresses:
+                            LOG.warn(
+                                "Found MAC address %s for interface '%s' is "
+                                "not one of the MAC addresses fetched by "
+                                "Coriolis for this instance: %s",
+                                curr_mac_address, curr_iface, mac_addresses)
+                        interfaces[curr_iface] = curr_mac_address
+                elif line.strip().startswith("address"):
+                    words = line.split()
+                    if len(words) > 1:
+                        curr_ip_address = words[1].split('/')[0]
+
+                        for nic in nics_info:
+                            nic_ip_addresses = nic.get('ip_addresses')
+                            if nic_ip_addresses and \
+                                curr_ip_address in nic_ip_addresses:
+                                interfaces[curr_iface] = nic.get('mac_address')
+                                break
+                        if not interfaces.get(curr_iface):
+                            LOG.warn(
+                                "Could not find IP address '%s' for interface "
+                                "'%s' in Coriolis NICs: %s",
+                                curr_ip_address, curr_iface, nics_info)
+                elif line.strip().startswith("source"):
+                    words = line.split()
+                    if len(words) > 1:
+                        source_path = words[1]
+                        if self._test_path(source_path):
+                            paths += self._exec_cmd_chroot(
+                                'ls -1 %s' % source_path).splitlines()
+
+        while paths:
+            _parse_iface_file(paths[0], mac_addresses)
+            paths.pop(0)
+
+        return interfaces
+
+    def _get_net_config_files(self, network_scripts_path):
+        dir_content = self._list_dir(network_scripts_path)
+        return [os.path.join(network_scripts_path, f) for f in
+                dir_content if re.match("^ifcfg-(.*)", f)]
+
+    def _get_nmconnection_files(self, network_scripts_path):
+        dir_content = self._list_dir(network_scripts_path)
+        return [os.path.join(network_scripts_path, f)
+                for f in dir_content if re.match(r"^(.*\.nmconnection)$", f)]
+
+    def _get_ifcfgs_by_type(self, ifcfg_type, network_scripts_path):
+        ifcfgs = []
+        for ifcfg_file in self._get_net_config_files(network_scripts_path):
+            ifcfg = self._read_config_file(ifcfg_file)
+            if ifcfg.get("TYPE") == ifcfg_type:
+                ifcfgs.append((ifcfg_file, ifcfg))
+        return ifcfgs
+
+    def _get_keyfiles_by_type(self, nmconnection_type, network_scripts_path):
+        keyfiles = []
+        for file in self._get_nmconnection_files(network_scripts_path):
+            keyfile = self._read_config_file(file)
+            if keyfile.get("type") == nmconnection_type:
+                keyfiles.append((file, keyfile))
+        return keyfiles
+
+    def _get_net_ifaces_info(self, ifcfgs_ethernet, nics_info):
+        net_ifaces_info = dict()
+
+        for ifcfg_file, ifcfg in ifcfgs_ethernet:
+            mac_address = ifcfg.get("HWADDR")
+            ip_address = ifcfg.get("IPADDR")
+            if not mac_address and ip_address:
+                for nic in nics_info:
+                    nic_ip_addresses = nic.get('ip_addresses')
+                    if ip_address in nic_ip_addresses:
+                        mac_address = nic.get('mac_address')
+                        break
+
+            if not mac_address:
+                self._event_manager.warn(
+                    "mac-address not defined and no matching IP found,"
+                    "skipping: %s" % ifcfg_file)
+                continue
+
+            name = ifcfg.get("DEVICE")
+            if not name:
+                # Get the name from the config file
+                name = re.match("^.*/ifcfg-(.*)", ifcfg_file).groups()[0]
+            net_ifaces_info[name] = mac_address
+        return net_ifaces_info
+
+    def _get_nmconnection_net_ifaces_info(self, nmconnection_files, nics_info):
+        net_ifaces_info = dict()
+
+        for nmconn_file, nmconn in nmconnection_files:
+            mac_address = nmconn.get("mac-address")
+            nm_ip_addresses = []
+            for key, value in nmconn.items():
+                if key.lower().startswith("address") and value:
+                    for addr in value.split(','):
+                        addr = addr.strip()
+                        ip = addr.split('/')[0] if '/' in addr else addr
+                        nm_ip_addresses.append(ip)
+
+            if not mac_address and nm_ip_addresses:
+                for ip in nm_ip_addresses:
+                    for nic in nics_info:
+                        nic_ip_addresses = nic.get('ip_addresses')
+                        if ip in nic_ip_addresses:
+                            mac_address = nic.get('mac_address')
+                            break
+
+            if not mac_address:
+                self._event_manager.warn(
+                    "mac-address not defined and no matching IP found,"
+                    "skipping: %s" % nmconn_file)
+                continue
+
+            name = nmconn.get("connection", {}).get("id")
+            if not name:
+                name = re.match(
+                    r"^.*/(.*)\.nmconnection$", nmconn_file).groups()[0]
+
+            net_ifaces_info[name] = mac_address
+
+        return net_ifaces_info
+
+    def _set_static_config(self, nics_info) -> None:
+        net_ifaces_info = dict()
+        network_scripts_path = "etc/sysconfig/network-scripts"
+        netplan_base = "etc/netplan"
+        ifaces_file = "etc/network/interfaces"
+        nmconnection_file = "etc/NetworkManager/system-connections"
+
+        if self._test_path(nmconnection_file):
+            nm_files = self._get_nmconnection_files(nmconnection_file)
+            if nm_files:
+                nmconnection_ethernet = self._get_keyfiles_by_type(
+                    "ethernet", nmconnection_file)
+                if nmconnection_ethernet:
+                    net_ifaces_info = self._get_nmconnection_net_ifaces_info(
+                        nmconnection_ethernet, nics_info)
+                    LOG.info("Using NetworkManager connection files for "
+                             "configuring static IP")
+
+        if not net_ifaces_info and self._test_path(ifaces_file):
+            if self._list_dir(os.path.dirname(ifaces_file)):
+                net_ifaces_info = self._get_interfaces_info(
+                    ifaces_file, nics_info)
+                LOG.info("Using interface files for configuring static IP")
+
+        if not net_ifaces_info and self._test_path(netplan_base):
+            netplan_files = [f for f in self._list_dir(netplan_base)
+                             if f.endswith(".yaml") or f.endswith(".yml")]
+            if netplan_files:
+                net_ifaces_info = self._get_netplan_info(
+                    netplan_base, nics_info)
+                LOG.info("Using netplan files for configuring static IP")
+
+        if not net_ifaces_info and self._test_path(network_scripts_path):
+            ifcfg_files = self._get_net_config_files(network_scripts_path)
+            if ifcfg_files:
+                ifcfgs_ethernet = self._get_ifcfgs_by_type(
+                    "Ethernet", network_scripts_path)
+                if ifcfgs_ethernet:
+                    net_ifaces_info = self._get_net_ifaces_info(
+                        ifcfgs_ethernet, nics_info)
+                    LOG.info("Using network scripts for configuring static IP")
+
+        self._add_net_udev_rules(net_ifaces_info.items())
+
+        return

@@ -30,6 +30,7 @@ LOG = logging.getLogger(__name__)
 class BaseDebianMorphingTools(base.BaseLinuxOSMorphingTools):
 
     netplan_base = "etc/netplan"
+    ifaces_file = "etc/network/interfaces"
 
     @classmethod
     def check_os_supported(cls, detected_os_info):
@@ -165,18 +166,17 @@ class BaseDebianMorphingTools(base.BaseLinuxOSMorphingTools):
 
     def set_net_config(self, nics_info, dhcp):
         if not dhcp:
-            if self._test_path(self.netplan_base):
-                self._preserve_static_netplan_configuration(nics_info)
+            self._set_static_config(nics_info)
             return
 
+        LOG.info("DHCP=True Setting DHCP configuration")
         self.disable_predictable_nic_names()
         if self._test_path("etc/network"):
-            ifaces_file = "etc/network/interfaces"
             contents = self._compose_interfaces_config(nics_info)
-            if self._test_path(ifaces_file):
+            if self._test_path(self.ifaces_file):
                 self._exec_cmd_chroot(
-                    "cp %s %s.bak" % (ifaces_file, ifaces_file))
-            self._write_file_sudo(ifaces_file, contents)
+                    "cp %s %s.bak" % (self.ifaces_file, self.ifaces_file))
+            self._write_file_sudo(self.ifaces_file, contents)
 
         if self._test_path(self.netplan_base):
             curr_files = self._list_dir(self.netplan_base)
