@@ -953,6 +953,35 @@ class BaseLinuxOSMorphingToolsTestBase(test_base.CoriolisBaseTestCase):
         mock_apply_grub2_config.assert_called_once_with(
             config_obj, False)
 
+    @ddt.data(
+        (
+            [("/path/to/ifcfg-file", {"HWADDR": "mac", "DEVICE": "test-name"})],
+            [{"mac_address": "mac"}],
+            {"test-name": "mac"}
+        ),
+        (
+            [("/path/to/ifcfg-file", {"DEVICE": "test-name", "IPADDR": "ip"})],
+            [{"mac_address": "mac", "ip_addresses": ["ip"]}],
+            {"test-name": "mac"}
+        ),
+        (
+            [("/path/to/ifcfg-file", {"HWADDR": "mac"})],
+            [{"mac_address": "mac", "ip_addresses": ["ip"]}],
+            {"file": "mac"}
+        ),
+        (
+            [("/path/to/ifcfg-file", {"DEVICE": "test-name", "IPADDR": "ip"})],
+            [{"mac_address": "mac", "ip_addresses": []}],
+            {}
+        )
+    )
+    @ddt.unpack
+    def test__get_net_ifaces_info(self, ifcfgs_ethernet, nics_info,
+                                  expected):
+        result = self.os_morphing_tools._get_net_ifaces_info(
+            ifcfgs_ethernet, nics_info)
+        self.assertEqual(result, expected)
+
     @mock.patch.object(base.BaseLinuxOSMorphingTools, '_apply_grub2_config')
     @mock.patch.object(base.BaseLinuxOSMorphingTools, '_set_grub2_cmdline')
     @mock.patch.object(base.BaseLinuxOSMorphingTools, 'set_grub_value')
@@ -976,3 +1005,56 @@ class BaseLinuxOSMorphingToolsTestBase(test_base.CoriolisBaseTestCase):
         mock_set_grub2_cmdline.assert_called_once_with(
             config_obj, ['console=tty0', 'console=ttyS0'])
         mock_apply_grub2_config.assert_called_once_with(config_obj, True)
+
+    @mock.patch.object(base.BaseLinuxOSMorphingTools, '_list_dir')
+    def test__get_net_config_files(self, mock_list_dir):
+        mock_list_dir.return_value = ['ifcfg-eth0', 'ifcfg-lo', 'other-file']
+
+        result = self.os_morphing_tools._get_net_config_files(
+            "etc/sysconfig/network-scripts")
+
+        expected_result = [
+            'etc/sysconfig/network-scripts/ifcfg-eth0',
+            'etc/sysconfig/network-scripts/ifcfg-lo'
+        ]
+
+        mock_list_dir.assert_called_once_with('etc/sysconfig/network-scripts')
+
+        self.assertEqual(result, expected_result)
+
+    @mock.patch.object(base.BaseLinuxOSMorphingTools, '_test_path')
+    @mock.patch.object(base.BaseLinuxOSMorphingTools, '_write_file_sudo')
+    def test_add_net_udev_rules(self, mock_write_file_sudo, mock_test_path):
+        mock_test_path.return_value = False
+        net_ifaces_info = [
+            ("eth0", "AA:BB:CC:DD:EE:FF"),
+            ("eth1", "FF:EE:DD:CC:BB:AA")
+        ]
+        content = (
+            'SUBSYSTEM=="net", ACTION=="add", DRIVERS=="?*", '
+            'ATTR{address}=="aa:bb:cc:dd:ee:ff", NAME="eth0"\n'
+            'SUBSYSTEM=="net", ACTION=="add", DRIVERS=="?*", '
+            'ATTR{address}=="ff:ee:dd:cc:bb:aa", NAME="eth1"\n'
+        )
+
+        self.os_morphing_tools._add_net_udev_rules(net_ifaces_info)
+
+        mock_write_file_sudo.assert_called_once_with(
+            "etc/udev/rules.d/70-persistent-net.rules", content
+        )
+
+    @mock.patch.object(base.BaseLinuxOSMorphingTools, '_read_config_file')
+    @mock.patch.object(base.BaseLinuxOSMorphingTools, '_get_net_config_files')
+    def test__get_ifcfgs_by_type(self, mock_get_net_config_files,
+                                 mock_read_config_file):
+        mock_get_net_config_files.return_value = [mock.sentinel.ifcfg_file]
+        mock_read_config_file.side_effect = [{"TYPE": "Ethernet"}]
+
+        result = self.os_morphing_tools._get_ifcfgs_by_type(
+            "Ethernet", "etc/sysconfig/network-scripts")
+
+        mock_read_config_file.assert_called_once_with(mock.sentinel.ifcfg_file)
+        mock_get_net_config_files.assert_called_once()
+
+        self.assertEqual(
+            result, [(mock.sentinel.ifcfg_file, {"TYPE": "Ethernet"})])

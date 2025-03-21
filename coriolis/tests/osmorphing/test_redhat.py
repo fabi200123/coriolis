@@ -121,56 +121,6 @@ class BaseRedHatMorphingToolsTestCase(test_base.CoriolisBaseTestCase):
             mock.call('/boot/grub2/grub.cfg')
         ])
 
-    @ddt.data(
-        (
-            [("/path/to/ifcfg-file", {"HWADDR": "mac", "NAME": "test-name"})],
-            [],
-            [("test-name", "mac")]
-        ),
-        (
-            [("/path/to/ifcfg-file", {"NAME": "test-name"})],
-            ["mac"],
-            [("test-name", "mac")]
-        ),
-        (
-            [("/path/to/ifcfg-file", {"HWADDR": "mac"})],
-            ["mac"],
-            [("file", "mac")]
-        ),
-        (
-            [("/path/to/ifcfg-file", {"NAME": "test-name"})],
-            [],
-            []
-        )
-    )
-    @ddt.unpack
-    def test__get_net_ifaces_info(self, ifcfgs_ethernet, mac_addresses,
-                                  expected):
-        result = self.morphing_tools._get_net_ifaces_info(
-            ifcfgs_ethernet, mac_addresses)
-        self.assertEqual(result, expected)
-
-    @mock.patch.object(base.BaseLinuxOSMorphingTools, '_test_path')
-    @mock.patch.object(base.BaseLinuxOSMorphingTools, '_write_file_sudo')
-    def test_add_net_udev_rules(self, mock_write_file_sudo, mock_test_path):
-        mock_test_path.return_value = False
-        net_ifaces_info = [
-            ("eth0", "AA:BB:CC:DD:EE:FF"),
-            ("eth1", "FF:EE:DD:CC:BB:AA")
-        ]
-        content = (
-            'SUBSYSTEM=="net", ACTION=="add", DRIVERS=="?*", '
-            'ATTR{address}=="aa:bb:cc:dd:ee:ff", NAME="eth0"\n'
-            'SUBSYSTEM=="net", ACTION=="add", DRIVERS=="?*", '
-            'ATTR{address}=="ff:ee:dd:cc:bb:aa", NAME="eth1"\n'
-        )
-
-        self.morphing_tools._add_net_udev_rules(net_ifaces_info)
-
-        mock_write_file_sudo.assert_called_once_with(
-            "etc/udev/rules.d/70-persistent-net.rules", content
-        )
-
     @mock.patch.object(base.BaseLinuxOSMorphingTools, '_exec_cmd_chroot')
     def test__has_systemd(self, mock_exec_cmd_chroot):
         result = self.morphing_tools._has_systemd()
@@ -214,21 +164,6 @@ class BaseRedHatMorphingToolsTestCase(test_base.CoriolisBaseTestCase):
             mock.call("etc/sysconfig/network",
                       mock_read_config_file.return_value)
         ])
-
-    @mock.patch.object(base.BaseLinuxOSMorphingTools, '_read_config_file')
-    @mock.patch.object(redhat.BaseRedHatMorphingTools, '_get_net_config_files')
-    def test__get_ifcfgs_by_type(self, mock_get_net_config_files,
-                                 mock_read_config_file):
-        mock_get_net_config_files.return_value = [mock.sentinel.ifcfg_file]
-        mock_read_config_file.side_effect = [{"TYPE": "Ethernet"}]
-
-        result = self.morphing_tools._get_ifcfgs_by_type("Ethernet")
-
-        mock_read_config_file.assert_called_once_with(mock.sentinel.ifcfg_file)
-        mock_get_net_config_files.assert_called_once()
-
-        self.assertEqual(
-            result, [(mock.sentinel.ifcfg_file, {"TYPE": "Ethernet"})])
 
     @mock.patch.object(base.BaseLinuxOSMorphingTools, '_write_file_sudo')
     @mock.patch.object(base.BaseLinuxOSMorphingTools, '_exec_cmd_chroot')
@@ -562,18 +497,3 @@ class BaseRedHatMorphingToolsTestCase(test_base.CoriolisBaseTestCase):
         result = self.morphing_tools._get_config_file_content(config)
 
         self.assertEqual(result, 'key1="value1"\nkey2="value2"\n')
-
-    @mock.patch.object(base.BaseLinuxOSMorphingTools, '_list_dir')
-    def test__get_net_config_files(self, mock_list_dir):
-        mock_list_dir.return_value = ['ifcfg-eth0', 'ifcfg-lo', 'other-file']
-
-        result = self.morphing_tools._get_net_config_files()
-
-        expected_result = [
-            'etc/sysconfig/network-scripts/ifcfg-eth0',
-            'etc/sysconfig/network-scripts/ifcfg-lo'
-        ]
-
-        mock_list_dir.assert_called_once_with('etc/sysconfig/network-scripts')
-
-        self.assertEqual(result, expected_result)
