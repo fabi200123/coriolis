@@ -993,6 +993,7 @@ class BaseLinuxOSMorphingToolsTestBase(test_base.CoriolisBaseTestCase):
 
     @ddt.data(
         (
+            None,
             ["vim"],
             {},
             False,
@@ -1001,6 +1002,7 @@ class BaseLinuxOSMorphingToolsTestBase(test_base.CoriolisBaseTestCase):
             False
         ),
         (
+            ["Oracle"],
             ["cloud-init"],
             {"retain_user_credentials": True, "set_dhcp": False},
             False,
@@ -1008,12 +1010,14 @@ class BaseLinuxOSMorphingToolsTestBase(test_base.CoriolisBaseTestCase):
             {
                 "disable_root": False,
                 "ssh_pwauth": True,
-                "users": None,
+                "users": [],
                 "network": {"config": "disabled"},
+                "datasource_list": ["Oracle"]
             },
             True
         ),
         (
+            [],
             ["cloud-init", "vim"],
             {"retain_user_credentials": False, "set_dhcp": True},
             True,
@@ -1022,6 +1026,7 @@ class BaseLinuxOSMorphingToolsTestBase(test_base.CoriolisBaseTestCase):
             False
         ),
         (
+            [],
             ["cloud-init", "vim"],
             {"retain_user_credentials": False, "set_dhcp": False},
             True,
@@ -1029,6 +1034,17 @@ class BaseLinuxOSMorphingToolsTestBase(test_base.CoriolisBaseTestCase):
             {
                 "network": {"config": "disabled"},
                 "cloud_init_modules": ["set_hostname", "write_files"]
+            },
+            False
+        ),
+        (
+            ["ConfigDrive", "OpenStack"],
+            ["cloud-init", "vim"],
+            {"retain_user_credentials": False, "set_dhcp": True},
+            True,
+            [],
+            {
+                "datasource_list": ["ConfigDrive", "OpenStack"]
             },
             False
         ),
@@ -1048,16 +1064,20 @@ class BaseLinuxOSMorphingToolsTestBase(test_base.CoriolisBaseTestCase):
     @mock.patch.object(base.BaseLinuxOSMorphingTools,
                        '_disable_installer_cloud_config')
     @mock.patch.object(base.BaseLinuxOSMorphingTools, 'get_packages')
+    @mock.patch.object(base.BaseLinuxOSMorphingTools, 'datasource_list',
+                       new_callable=mock.PropertyMock)
     def test__configure_cloud_init(
-            self, returned_packages, osmorphing_params, creates_cloudinit_user,
-            cloud_init_modules,
-            expected_result, has_systemd_chroot, mock_get_packages,
+            self, datasource_list, returned_packages, osmorphing_params,
+            creates_cloudinit_user, cloud_init_modules, expected_result,
+            has_systemd_chroot, mock_datasource_list, mock_get_packages,
             mock__disable_installer_cloud_config,
             mock__ensure_cloud_init_not_disabled, mock__reset_cloud_init_run,
             mock__create_cloudinit_user, mock__write_cloud_init_mods_config,
             mock__get_cloud_init_modules,
             mock__has_systemd_chroot, mock__enable_systemd_service
     ):
+        if datasource_list is not None:
+            mock_datasource_list.return_value = datasource_list
         mock_get_packages.return_value = returned_packages
         self.os_morphing_tools._osmorphing_parameters = osmorphing_params
         mock__has_systemd_chroot.return_value = has_systemd_chroot
