@@ -383,33 +383,6 @@ class BaseRedHatMorphingToolsTestCase(test_base.CoriolisBaseTestCase):
 
         mock_exec_cmd_chroot.assert_called_once_with("yum clean all")
 
-    @mock.patch.object(base.BaseLinuxOSMorphingTools, '_list_dir')
-    @mock.patch.object(base.BaseLinuxOSMorphingTools, '_read_file_sudo')
-    def test__find_yum_repos_found(self, mock_read_file_sudo, mock_list_dir):
-        mock_list_dir.return_value = ['file1.repo', 'file2.repo']
-        mock_read_file_sudo.return_value = b'[repo1]\n[repo2]'
-        repos_to_enable = ['repo1']
-
-        result = self.morphing_tools._find_yum_repos(repos_to_enable)
-
-        mock_read_file_sudo.assert_has_calls([
-            mock.call('etc/yum.repos.d/file1.repo'),
-            mock.call('etc/yum.repos.d/file2.repo')
-        ])
-
-        self.assertEqual(result, ['repo1'])
-
-    @mock.patch.object(base.BaseLinuxOSMorphingTools, '_list_dir')
-    @mock.patch.object(base.BaseLinuxOSMorphingTools, '_read_file_sudo')
-    def test__find_yum_repos_not_found(self, mock_read_file_sudo,
-                                       mock_list_dir):
-        mock_list_dir.return_value = ['file1.repo', 'file2.repo']
-        mock_read_file_sudo.return_value = b'[repo1]\n[repo2]'
-        repos_to_enable = ['repo3']
-
-        with self.assertLogs('coriolis.osmorphing.redhat', level=logging.WARN):
-            self.morphing_tools._find_yum_repos(repos_to_enable)
-
     @mock.patch.object(redhat.BaseRedHatMorphingTools, '_yum_install')
     @mock.patch.object(redhat.BaseRedHatMorphingTools, '_yum_clean_all')
     @mock.patch.object(base.BaseLinuxOSMorphingTools, 'pre_packages_install')
@@ -450,14 +423,10 @@ class BaseRedHatMorphingToolsTestCase(test_base.CoriolisBaseTestCase):
         mock_post_packages_install.assert_called_once_with(self.package_names)
 
     @mock.patch.object(redhat.BaseRedHatMorphingTools, '_yum_install')
-    @mock.patch.object(redhat.BaseRedHatMorphingTools, '_get_repos_to_enable')
-    def test_install_packages(self, mock_get_repos_to_enable,
-                              mock_yum_install):
+    def test_install_packages(self, mock_yum_install):
         self.morphing_tools.install_packages(self.package_names)
 
-        mock_get_repos_to_enable.assert_called_once()
-        mock_yum_install.assert_called_once_with(
-            self.package_names, mock_get_repos_to_enable.return_value)
+        mock_yum_install.assert_called_once_with(self.package_names)
 
     @mock.patch.object(redhat.BaseRedHatMorphingTools, '_yum_uninstall')
     def test_uninstall_packages(self, mock_yum_uninstall):

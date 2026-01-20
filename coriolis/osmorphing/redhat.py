@@ -179,11 +179,9 @@ class BaseRedHatMorphingTools(base.BaseLinuxOSMorphingTools):
             LOG.trace(utils.get_exception_details())
             self.installed_packages = []
 
-    def _yum_install(self, package_names, enable_repos=[]):
+    def _yum_install(self, package_names):
         try:
-            yum_cmd = 'yum install %s -y%s' % (
-                " ".join(package_names),
-                "".join([" --enablerepo=%s" % r for r in enable_repos]))
+            yum_cmd = 'yum install %s -y' % " ".join(package_names)
             self._exec_cmd_chroot(yum_cmd)
         except exception.CoriolisException as err:
             raise exception.FailedPackageInstallationException(
@@ -205,56 +203,6 @@ class BaseRedHatMorphingTools(base.BaseLinuxOSMorphingTools):
         if self._test_path('var/cache/yum'):
             self._exec_cmd_chroot("rm -rf /var/cache/yum")
 
-    def _find_yum_repos(self, repos_to_enable=[]):
-        """
-        Looks for required repositories passed as `repos_to_enable` in
-        /etc/yum.repos.d and returns the found repository names, so they can
-        be temporarily enabled when installing packages using yum.
-
-        Yum only looks for repos in files with '.repo' extension, anything
-        else gets ignored, therefore this method should filter files by that
-        extension.
-
-        Also, yum repository names might be different in some guest releases,
-        but still be similar. Therefore, repo name substrings should ideally be
-        passed in `repos_to_enable`. For example, we might be looking for repo
-        name 'ol7_latest', but the guest has it named as 'public_ol7_latest' in
-        the repo file.
-        """
-        found_repos = []
-
-        reposdir_path = 'etc/yum.repos.d'
-
-        repofiles = [
-            f for f in self._list_dir(reposdir_path) if f.endswith('.repo')]
-        installed_repos = []
-        for file in repofiles:
-            path = os.path.join(reposdir_path, file)
-            try:
-                content = self._read_file_sudo(path).decode()
-            except Exception as e:
-                LOG.warning(
-                    "Could not read yum repository file %s: %s", path, e)
-                continue
-            for line in content.splitlines():
-                m = re.match(r'^\[(.+)\]$', line)
-                if m:
-                    installed_repos.append(m.group(1))
-
-        for repo in repos_to_enable:
-            available_repos = [ir for ir in installed_repos if repo in ir]
-            available_repos.sort(key=len)
-            if available_repos:
-                found_repos.append(available_repos[0])
-            else:
-                LOG.warn(
-                    "Could not find yum repository while searching for "
-                    "repositories to enable: %s.", repo)
-
-        return found_repos
-
-    def _get_repos_to_enable(self):
-        return []
 
     def pre_packages_install(self, package_names):
         super(BaseRedHatMorphingTools, self).pre_packages_install(
@@ -272,8 +220,7 @@ class BaseRedHatMorphingTools(base.BaseLinuxOSMorphingTools):
             package_names)
 
     def install_packages(self, package_names):
-        enable_repos = self._get_repos_to_enable()
-        self._yum_install(package_names, enable_repos)
+        self._yum_install(package_names)
 
     def uninstall_packages(self, package_names):
         self._yum_uninstall(package_names)
