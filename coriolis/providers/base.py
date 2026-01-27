@@ -217,7 +217,7 @@ class BaseImportInstanceProvider(BaseInstanceProvider):
     def get_target_environment_schema(self):
         pass
 
-    def _get_destination_instance_name(self, export_info, instance_name):
+    def _get_destination_instance_name(self, export_info, instance_name=None):
         dest_instance_name = export_info.get("name", instance_name)
         LOG.debug('Destination instance name for "%(instance_name)s": '
                   '"%(dest_instance_name)s"',
