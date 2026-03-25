@@ -285,6 +285,9 @@ class BaseTransferAction(BASE, models.TimestampMixin, models.ModelBase,
         sqlalchemy.Boolean, nullable=False, default=True)
     skip_os_morphing = sqlalchemy.Column(
         sqlalchemy.Boolean, nullable=False, default=False)
+    # Multi-instance transfer hint; must be set on INSERT (MySQL NOT NULL).
+    clustered = sqlalchemy.Column(
+        sqlalchemy.Boolean, nullable=False, default=False)
 
     __mapper_args__ = {
         'polymorphic_identity': 'base_transfer_action',
@@ -320,6 +323,7 @@ class BaseTransferAction(BASE, models.TimestampMixin, models.ModelBase,
             "user_scripts": self.user_scripts,
             "clone_disks": self.clone_disks,
             "skip_os_morphing": self.skip_os_morphing,
+            "clustered": bool(self.clustered),
         }
         if include_executions:
             for ex in self.executions:

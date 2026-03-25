@@ -1293,7 +1293,10 @@ class ConductorServerEndpoint(object):
                                   destination_environment, instances,
                                   network_map, storage_mappings, notes=None,
                                   user_scripts=None, clone_disks=True,
-                                  skip_os_morphing=False):
+                                  skip_os_morphing=False, clustered=None):
+        if clustered is None:
+            clustered = len(instances) > 1
+        clustered = bool(clustered)
         supported_scenarios = [
             constants.TRANSFER_SCENARIO_REPLICA,
             constants.TRANSFER_SCENARIO_LIVE_MIGRATION]
@@ -1330,6 +1333,7 @@ class ConductorServerEndpoint(object):
         transfer.user_scripts = user_scripts or {}
         transfer.clone_disks = clone_disks
         transfer.skip_os_morphing = skip_os_morphing
+        transfer.clustered = clustered
 
         self._check_minion_pools_for_action(ctxt, transfer)
 
@@ -1738,6 +1742,7 @@ class ConductorServerEndpoint(object):
         deployment.user_scripts = user_scripts
         deployment.clone_disks = clone_disks
         deployment.skip_os_morphing = skip_os_morphing
+        deployment.clustered = bool(getattr(transfer, 'clustered', False))
         deployment.deployer_id = wait_for_execution
         deployment.trust_id = trust_id
         deployment.last_execution_status = init_status
@@ -2091,7 +2096,8 @@ class ConductorServerEndpoint(object):
                         "of the parent tasks execution."))
             elif task.status in (
                     constants.TASK_STATUS_PENDING,
-                    constants.TASK_STATUS_STARTING):
+                    constants.TASK_STATUS_STARTING,
+                    constants.TASK_STATUS_SYNCING):
                 # any PENDING/STARTING tasks means that they did not have a
                 # host assigned to them yet, and presuming the host does not
                 # start executing the task until it marks itself as the runner,
@@ -2536,6 +2542,99 @@ class ConductorServerEndpoint(object):
 
         started_tasks = []
 
+        def _normalize_identity(raw_value):
+            if raw_value is None:
+                return None
+            normalized = str(raw_value).strip()
+            if not normalized:
+                return None
+            return normalized.lower()
+
+        def _get_disk_identity(disk_info):
+            disk_info = disk_info or {}
+            for key in ("native_id", "uuid", "path", "name", "disk_id", "id"):
+                ident = _normalize_identity(disk_info.get(key))
+                if ident:
+                    if key in ("disk_id", "id") and ident.isdigit():
+                        continue
+                    return ident
+            return None
+
+        def _get_all_disk_identities_for_instance(instance_id):
+            task_info = action.info.get(instance_id, {})
+            export_info = task_info.get("export_info", {})
+            disks = export_info.get("devices", {}).get("disks", [])
+            identities = []
+            for disk in disks:
+                ident = _get_disk_identity(disk)
+                if ident:
+                    identities.append({
+                        "identity": ident,
+                        "shareable": bool(disk.get("shareable"))})
+            return identities
+
+        def _get_shared_disk_identities():
+            identity_count = {}
+            identity_marked_shareable = {}
+            for instance_id in action.instances:
+                for entry in _get_all_disk_identities_for_instance(
+                        instance_id):
+                    ident = entry["identity"]
+                    identity_count[ident] = identity_count.get(ident, 0) + 1
+                    if entry["shareable"]:
+                        identity_marked_shareable[ident] = True
+
+            return {
+                ident for ident, count in identity_count.items()
+                if count > 1 or identity_marked_shareable.get(ident, False)}
+
+        def _get_shared_disk_owner_by_identity():
+            shared_identities = _get_shared_disk_identities()
+            owners = {}
+            for instance_id in action.instances:
+                for entry in _get_all_disk_identities_for_instance(
+                        instance_id):
+                    ident = entry["identity"]
+                    if ident not in shared_identities:
+                        continue
+                    if ident not in owners:
+                        owners[ident] = instance_id
+            return owners
+
+        def _should_sync_replicate_task(task):
+            if task.task_type not in (
+                    constants.TASK_TYPES_REQUIRING_CLUSTER_SYNC):
+                return False
+            if not bool(getattr(action, "clustered", False)):
+                return False
+
+            owners = _get_shared_disk_owner_by_identity()
+            if not owners:
+                return False
+
+            instance_id = task.instance
+            instance_identities = [
+                entry["identity"]
+                for entry in _get_all_disk_identities_for_instance(instance_id)
+                if entry["identity"] in owners]
+            if not instance_identities:
+                return False
+
+            task_by_instance = {
+                t.instance: t for t in execution.tasks
+                if t.task_type in constants.TASK_TYPES_REQUIRING_CLUSTER_SYNC}
+            for ident in instance_identities:
+                owner = owners.get(ident)
+                if not owner or owner == instance_id:
+                    continue
+                owner_task = task_by_instance.get(owner)
+                if (
+                        owner_task
+                        and owner_task.status !=
+                        constants.TASK_STATUS_COMPLETED):
+                    return True
+            return False
+
         def _start_task(task):
             task_info = None
             if task.instance not in action.info:
@@ -2601,6 +2700,15 @@ class ConductorServerEndpoint(object):
         for task in sorted(tasks_to_process, key=lambda t: t.index):
 
             if task_statuses[task.id] == constants.TASK_STATUS_SCHEDULED:
+                if _should_sync_replicate_task(task):
+                    LOG.info(
+                        "Task '%s' for instance '%s' entering SYNCING while "
+                        "waiting for shared-disk owner task to complete.",
+                        task.id, task.instance)
+                    db_api.set_task_status(
+                        ctxt, task.id, constants.TASK_STATUS_SYNCING)
+                    task_statuses[task.id] = constants.TASK_STATUS_SYNCING
+                    continue
 
                 # immediately start depency-less tasks (on-error or otherwise)
                 if not task_deps[task.id]:
@@ -2759,6 +2867,174 @@ class ConductorServerEndpoint(object):
                 execution.id, latest_execution_status, task_statuses)
 
         return started_tasks
+
+    def _release_cluster_synced_replicate_tasks(
+            self, ctxt, execution, action_id, completed_task):
+        """Unblocks SYNCING replicate tasks after owner completion.
+
+        This is a task-level barrier used for clustered transfers with
+        shared disks. Once the owner replicate task completes, any
+        waiting (SYNCING) replicate tasks are moved back to SCHEDULED
+        so they can continue their normal flow.
+        """
+        if completed_task.task_type not in (
+                constants.TASK_TYPES_REQUIRING_CLUSTER_SYNC):
+            return []
+        action = db_api.get_action(ctxt, action_id, include_task_info=True)
+        if not bool(getattr(action, "clustered", False)):
+            return []
+
+        def _normalize_identity(raw_value):
+            if raw_value is None:
+                return None
+            normalized = str(raw_value).strip()
+            if not normalized:
+                return None
+            return normalized.lower()
+
+        def _get_disk_identity(disk_info):
+            disk_info = disk_info or {}
+            for key in ("native_id", "uuid", "path", "name", "disk_id", "id"):
+                ident = _normalize_identity(disk_info.get(key))
+                if ident:
+                    if key in ("disk_id", "id") and ident.isdigit():
+                        continue
+                    return ident
+            return None
+
+        def _get_instance_export_disks(instance_id):
+            info = action.info.get(instance_id, {})
+            return (
+                info.get("export_info", {})
+                .get("devices", {})
+                .get("disks", [])
+            )
+
+        def _get_instance_disk_identity_to_disk_id(instance_id):
+            mapping = {}
+            for disk in _get_instance_export_disks(instance_id):
+                ident = _get_disk_identity(disk)
+                disk_id = disk.get("id")
+                if ident and disk_id and ident not in mapping:
+                    mapping[ident] = disk_id
+            return mapping
+
+        def _get_shared_identities():
+            identity_counts = {}
+            explicitly_shareable = {}
+            for instance_id in action.instances:
+                for disk in _get_instance_export_disks(instance_id):
+                    ident = _get_disk_identity(disk)
+                    if not ident:
+                        continue
+                    identity_counts[ident] = identity_counts.get(ident, 0) + 1
+                    if disk.get("shareable"):
+                        explicitly_shareable[ident] = True
+            return {
+                ident for ident, count in identity_counts.items()
+                if count > 1 or explicitly_shareable.get(ident, False)}
+
+        shared_identities = _get_shared_identities()
+        if not shared_identities:
+            return []
+
+        owner_instance = completed_task.instance
+        owner_identity_to_disk_id = _get_instance_disk_identity_to_disk_id(
+            owner_instance)
+        owner_disk_id_to_volume = {
+            vol.get("disk_id"): copy.deepcopy(vol)
+            for vol in action.info.get(owner_instance, {}).get(
+                "volumes_info", [])
+            if vol.get("disk_id")}
+        owner_updated_disk_ids = set()
+
+        released_instances = []
+        for task in execution.tasks:
+            if task.task_type not in (
+                    constants.TASK_TYPES_REQUIRING_CLUSTER_SYNC):
+                continue
+            if task.status != constants.TASK_STATUS_SYNCING:
+                continue
+
+            waiter_identity_to_disk_id = (
+                _get_instance_disk_identity_to_disk_id(task.instance)
+            )
+            waiter_info = copy.deepcopy(action.info.get(task.instance, {}))
+            waiter_volumes = waiter_info.get("volumes_info", []) or []
+            waiter_disk_id_to_volume = {
+                vol.get("disk_id"): copy.deepcopy(vol)
+                for vol in waiter_volumes if vol.get("disk_id")}
+
+            inherited_count = 0
+            for identity in shared_identities:
+                owner_disk_id = owner_identity_to_disk_id.get(identity)
+                waiter_disk_id = waiter_identity_to_disk_id.get(identity)
+                owner_volume = owner_disk_id_to_volume.get(owner_disk_id)
+                if not owner_disk_id or not waiter_disk_id or not owner_volume:
+                    continue
+                owner_volume[constants.VOLUME_INFO_REPLICATE_DISK_DATA] = False
+                if "shareable" not in owner_volume:
+                    owner_volume["shareable"] = True
+                owner_updated_disk_ids.add(owner_disk_id)
+                inherited_volume = copy.deepcopy(owner_volume)
+                inherited_volume["disk_id"] = waiter_disk_id
+                inherited_volume[constants.VOLUME_INFO_REPLICATE_DISK_DATA] = (
+                    False)
+                waiter_disk_id_to_volume[waiter_disk_id] = inherited_volume
+                inherited_count += 1
+
+            if owner_updated_disk_ids:
+                owner_current_info = copy.deepcopy(
+                    action.info.get(owner_instance, {}))
+                owner_current_volumes = (
+                    owner_current_info.get("volumes_info", []) or [])
+                owner_updated_volumes = []
+                for owner_existing in owner_current_volumes:
+                    owner_disk_id = owner_existing.get("disk_id")
+                    if owner_disk_id in owner_updated_disk_ids:
+                        owner_updated_volumes.append(
+                            copy.deepcopy(
+                                owner_disk_id_to_volume[owner_disk_id]))
+                    else:
+                        owner_updated_volumes.append(owner_existing)
+                db_api.update_transfer_action_info_for_instance(
+                    ctxt, action_id, owner_instance,
+                    {"volumes_info": owner_updated_volumes})
+
+            if inherited_count:
+                merged_waiter_volumes = list(waiter_disk_id_to_volume.values())
+                db_api.update_transfer_action_info_for_instance(
+                    ctxt, action_id, task.instance,
+                    {"volumes_info": merged_waiter_volumes})
+                LOG.info(
+                    "Inherited %d shared disk volume mappings for waiter "
+                    "instance '%s' from owner instance '%s'.",
+                    inherited_count, task.instance, owner_instance)
+
+            waiter_all_identities = set(waiter_identity_to_disk_id.keys())
+            waiter_non_shared_identities = {
+                ident for ident in waiter_all_identities
+                if ident not in shared_identities}
+            if waiter_non_shared_identities:
+                LOG.info(
+                    "Releasing SYNCING replicate task '%s' for instance '%s' "
+                    "back to SCHEDULED after inheriting shared mappings. "
+                    "Task still has %d non-shared disk(s) to replicate.",
+                    task.id, task.instance, len(waiter_non_shared_identities))
+                db_api.set_task_status(
+                    ctxt, task.id, constants.TASK_STATUS_SCHEDULED)
+            else:
+                LOG.info(
+                    "Auto-completing SYNCING replicate task '%s' for instance "
+                    "'%s' after completion of owner task '%s'.",
+                    task.id, task.instance, completed_task.id)
+                db_api.set_task_status(
+                    ctxt, task.id, constants.TASK_STATUS_COMPLETED,
+                    exception_details=(
+                        "Task auto-completed after inheriting shared-disk "
+                        "replication results from the owner task."))
+            released_instances.append(task.instance)
+        return released_instances
 
     @staticmethod
     def _update_transfer_volumes_info(ctxt, transfer_id, instance,
@@ -3103,6 +3379,11 @@ class ConductorServerEndpoint(object):
 
             newly_started_tasks = self._advance_execution_state(
                 ctxt, execution, instance=task.instance, requery=False)
+            released_instances = self._release_cluster_synced_replicate_tasks(
+                ctxt, execution, action_id, task)
+            for released_instance in released_instances:
+                self._advance_execution_state(
+                    ctxt, execution, instance=released_instance, requery=True)
             if newly_started_tasks:
                 LOG.info(
                     "The following tasks were started for execution '%s' "

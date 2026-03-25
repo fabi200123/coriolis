@@ -197,6 +197,7 @@ class ConductorClientTestCase(test_base.CoriolisRPCClientTestCase):
             "user_scripts": None,
             "clone_disks": True,
             "skip_os_morphing": False,
+            "clustered": None,
         }
         args.update(new_args)
         self._test(self.client.create_instances_transfer, args)

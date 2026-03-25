@@ -313,6 +313,7 @@ class BaseTransferActionTestCase(test_base.CoriolisBaseTestCase):
             "user_scripts": mock.sentinel.user_scripts,
             "info": mock.sentinel.info,
             "clone_disks": True,
+            "clustered": False,
             "skip_os_morphing": False,
         }
 

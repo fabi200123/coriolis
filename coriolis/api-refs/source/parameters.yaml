@@ -123,6 +123,14 @@ connection_info_schema:
   in: body
   type: object
   required: false
+clustered:
+  description: |
+    Present only in API responses (read-only). ``true`` when the transfer
+    includes more than one instance, ``false`` for a single instance. Not
+    stored in the database; derived from ``instances``.
+  in: body
+  type: boolean
+  required: false
 deployment_cancel:
   description: |
     Object containing information about the type of deployment cancellation.
