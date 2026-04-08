@@ -244,7 +244,6 @@ class ReplicateDisksTask(base.TaskRunner):
         source_environment = task_info['source_environment']
 
         source_resources = task_info.get('source_resources', {})
-
         volumes_to_replicate = [
             vol for vol in volumes_info
             if vol.get(constants.VOLUME_INFO_REPLICATE_DISK_DATA, True)]
@@ -588,6 +587,11 @@ class DeployReplicaTargetResourcesTask(base.TaskRunner):
         connection_info = base.get_connection_info(ctxt, destination)
 
         volumes_info = _get_volumes_info(task_info)
+        # Minion attach runs in parallel before conductor's DEPLOY barrier can
+        # merge shareable onto volumes_info; promote from export_info so QEMU
+        # opens shared libvirt volumes with a multi-writer lock.
+        utils.apply_export_disk_shareable_metadata_to_volumes_info(
+            export_info, volumes_info)
 
         replica_resources_info = provider.deploy_replica_target_resources(
             ctxt, connection_info, target_environment, volumes_info)

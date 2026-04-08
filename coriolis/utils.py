@@ -196,6 +196,84 @@ def retry_on_error(max_attempts=5, sleep_seconds=1,
     return _retry_on_error
 
 
+# VMware snapshot redo descriptor: ``dir/vm_2-000001.vmdk`` parents ``vm_2.vmdk``.
+_VMDK_UNIT_SNAPSHOT_REDO = re.compile(
+    r'^(?P<prefix>.+)_(?P<unit>\d+)-(?P<snap>\d+)\.vmdk$', re.IGNORECASE)
+
+
+def normalized_volume_disk_path_key(disk_id):
+    """Case/whitespace-insensitive key for matching disk paths across instances.
+
+    vSphere may return the same VMDK path with different casing per VM;
+    volumes_info disk_id must still align with export_info for shared-disk
+    waiter inheritance (replicate_disk_data=False).
+    """
+    if disk_id is None:
+        return None
+    s = str(disk_id).strip().lower()
+    return s if s else None
+
+
+def cluster_disk_identity(disk_id):
+    """Canonical disk id for clustered shared-disk logic (VMware-aware).
+
+    The same multi-writer LUN often appears as base ``*_N.vmdk`` on one node
+    and snapshot redo ``*_N-000001.vmdk`` on another; they must map to one
+    identity so DEPLOY/REPLICATE barriers set replicate_disk_data=False on
+    waiters and VMware skips a second full copy.
+    """
+    key = normalized_volume_disk_path_key(disk_id)
+    if not key:
+        return None
+    slash = key.rfind('/')
+    if slash >= 0:
+        dirname, base_name = key[:slash], key[slash + 1:]
+    else:
+        dirname, base_name = '', key
+    m = _VMDK_UNIT_SNAPSHOT_REDO.match(base_name.strip())
+    if not m:
+        return key
+    canon_base = '%s_%s.vmdk' % (m.group('prefix'), m.group('unit'))
+    if dirname:
+        return '%s/%s' % (dirname, canon_base)
+    return canon_base
+
+
+def apply_export_disk_shareable_metadata_to_volumes_info(
+        export_info, volumes_info):
+    """Copy shareable from export_info disks onto volumes_info by cluster id.
+
+    Conductor may refresh volumes_info (replicate_disk_data, shareable) only
+    after a DEPLOY barrier; parallel ``deploy_replica_target_resources`` runs
+    attach minion disks earlier. Without ``shareable`` on the libvirt volume,
+    the second minion can hit QEMU ``device_add``: Failed to get "write" lock.
+    """
+    if not export_info or not volumes_info:
+        return
+    disks = export_info.get("devices", {}).get("disks") or []
+    share_cluster = set()
+    share_norm = set()
+    for d in disks:
+        if d.get("shareable"):
+            did = d.get("id")
+            cid = cluster_disk_identity(did)
+            if cid:
+                share_cluster.add(cid)
+            nk = normalized_volume_disk_path_key(did)
+            if nk:
+                share_norm.add(nk)
+    if not share_cluster and not share_norm:
+        return
+    for vol in volumes_info:
+        cid = cluster_disk_identity(vol.get("disk_id"))
+        if cid and cid in share_cluster:
+            vol["shareable"] = True
+            continue
+        nk = normalized_volume_disk_path_key(vol.get("disk_id"))
+        if nk and nk in share_norm:
+            vol["shareable"] = True
+
+
 def get_udev_net_rules(net_ifaces_info):
     content = ""
     for name, mac_address in net_ifaces_info.items():
@@ -725,11 +803,12 @@ def _get_systemd_unit_path(ssh):
     return "/usr/lib/systemd/system"
 
 
-def _write_systemd(ssh, cmdline, svcname, run_as=None, start=True):
+def _write_systemd(ssh, cmdline, svcname, run_as=None, start=True,
+                   force_update=False):
     systemd_unit_dir = _get_systemd_unit_path(ssh)
     serviceFilePath = "%s/%s.service" % (systemd_unit_dir, svcname)
 
-    if test_ssh_path(ssh, serviceFilePath):
+    if test_ssh_path(ssh, serviceFilePath) and not force_update:
         return
 
     def _reload_and_start(start=True):
@@ -771,10 +850,11 @@ def _write_systemd(ssh, cmdline, svcname, run_as=None, start=True):
     _reload_and_start(start=start)
 
 
-def _write_upstart(ssh, cmdline, svcname, run_as=None, start=True):
+def _write_upstart(ssh, cmdline, svcname, run_as=None, start=True,
+                   force_update=False):
     serviceFilePath = "/etc/init/%s.conf" % svcname
 
-    if test_ssh_path(ssh, serviceFilePath):
+    if test_ssh_path(ssh, serviceFilePath) and not force_update:
         return
 
     if run_as:
@@ -802,16 +882,21 @@ def _has_systemd(ssh):
 
 
 @retry_on_error()
-def create_service(ssh, cmdline, svcname, run_as=None, start=True):
+def create_service(ssh, cmdline, svcname, run_as=None, start=True,
+                   force_update=False):
     # Simplistic check for init system. We usually use official images,
     # and none of the supported operating systems come with both upstart
     # and systemd installed side by side. So if /lib/systemd/system
     # exists, it's usually systemd enabled. If not, but /etc/init
     # exists, it's upstart
     if _has_systemd(ssh):
-        _write_systemd(ssh, cmdline, svcname, run_as=run_as, start=start)
+        _write_systemd(
+            ssh, cmdline, svcname, run_as=run_as, start=start,
+            force_update=force_update)
     elif test_ssh_path(ssh, "/etc/init"):
-        _write_upstart(ssh, cmdline, svcname, run_as=run_as, start=start)
+        _write_upstart(
+            ssh, cmdline, svcname, run_as=run_as, start=start,
+            force_update=force_update)
     else:
         raise exception.CoriolisException(
             "could not determine init system")

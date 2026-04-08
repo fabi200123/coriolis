@@ -164,7 +164,11 @@ TASK_TYPE_POWER_ON_DESTINATION_MINION = "POWER_ON_DESTINATION_MINION"
 TASK_TYPE_POWER_OFF_DESTINATION_MINION = "POWER_OFF_DESTINATION_MINION"
 
 TASK_TYPES_TO_SYNC = [
+    # All instances must publish export_info before cluster-wide shareable
+    # promotion; deploy and replicate barriers coordinate shared disks.
+    TASK_TYPE_GET_INSTANCE_INFO,
     TASK_TYPE_DEPLOY_TRANSFER_DISKS,
+    TASK_TYPE_REPLICATE_DISKS,
 ]
 
 MINION_POOL_OPERATIONS_TASKS = [

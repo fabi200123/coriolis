@@ -31,6 +31,10 @@ VERSION = "1.0"
 LOG = logging.getLogger(__name__)
 
 
+_normalized_volume_disk_path_key = utils.normalized_volume_disk_path_key
+_cluster_disk_identity = utils.cluster_disk_identity
+
+
 CONDUCTOR_OPTS = [
     cfg.BoolOpt("debug_os_morphing_errors",
                 default=False,
@@ -1293,8 +1297,10 @@ class ConductorServerEndpoint(object):
                                   destination_environment, instances,
                                   network_map, storage_mappings, notes=None,
                                   user_scripts=None, clone_disks=True,
-                                  skip_os_morphing=False):
-        clustered = len(instances) > 1
+                                  skip_os_morphing=False, clustered=None):
+        if clustered is None:
+            clustered = len(instances) > 1
+        clustered = bool(clustered)
         supported_scenarios = [
             constants.TRANSFER_SCENARIO_REPLICA,
             constants.TRANSFER_SCENARIO_LIVE_MIGRATION]
@@ -2189,6 +2195,30 @@ class ConductorServerEndpoint(object):
                 "No new tasks were started for execution '%s' following "
                 "state advancement after cancellation.", execution.id)
 
+    def _abort_peer_sync_barrier_tasks_on_error(
+            self, ctxt, execution, errored_task, error_message):
+        """Mark peer tasks stuck in SYNCING on the same barrier as failed."""
+        if errored_task.task_type not in constants.TASK_TYPES_TO_SYNC:
+            return
+        action = db_api.get_action(
+            ctxt, execution.action_id, include_task_info=True)
+        if not bool(getattr(action, "clustered", False)):
+            return
+        execution = db_api.get_tasks_execution(ctxt, execution.id)
+        for peer in execution.tasks:
+            if peer.id == errored_task.id:
+                continue
+            if peer.status != constants.TASK_STATUS_SYNCING:
+                continue
+            if peer.task_type != errored_task.task_type:
+                continue
+            db_api.set_task_status(
+                ctxt, peer.id, constants.TASK_STATUS_ERROR,
+                exception_details=(
+                    "Aborted: peer task '%s' failed during clustered "
+                    "execution. Original error: %s" % (
+                        errored_task.id, error_message)))
+
     def _update_reservation_fulfillment_for_execution(self, ctxt, execution):
         """ Updates the reservation fulfillment status for the parent
         transfer action of the given execution based on its type.
@@ -2785,6 +2815,69 @@ class ConductorServerEndpoint(object):
             self._update_transfer_volumes_info(
                 ctxt, transfer_id, instance, updated_task_info)
 
+    def _promote_clustered_shared_disk_shareable_in_export_info(
+            self, ctxt, execution):
+        """Align ``shareable`` on disks in ``export_info`` for clustered transfers.
+
+        vSphere may omit ``sharingMultiWriter`` on some VMs that attach the
+        same multi-writer VMDK. Destination providers (e.g. Libvirt) read
+        per-instance ``export_info`` when creating volumes, so every instance
+        that references the same backing file must see ``shareable: True``
+        when any peer does or when the same disk id appears on multiple
+        instances.
+        """
+        action = db_api.get_action(
+            ctxt, execution.action_id, include_task_info=True)
+        if not getattr(action, "clustered", False):
+            return
+        if not action.instances:
+            return
+
+        def _norm_disk_id(disk_info):
+            return _cluster_disk_identity((disk_info or {}).get("id"))
+
+        ident_counts = {}
+        ident_any_shareable = {}
+        for instance_id in action.instances:
+            export_info = action.info.get(instance_id, {}).get("export_info")
+            if not export_info:
+                continue
+            for disk in export_info.get("devices", {}).get("disks", []):
+                ident = _norm_disk_id(disk)
+                if not ident:
+                    continue
+                ident_counts[ident] = ident_counts.get(ident, 0) + 1
+                if disk.get("shareable"):
+                    ident_any_shareable[ident] = True
+
+        shared_idents = {
+            ident for ident, count in ident_counts.items()
+            if count > 1 or ident_any_shareable.get(ident, False)}
+        if not shared_idents:
+            return
+
+        for instance_id in action.instances:
+            export_info = action.info.get(instance_id, {}).get("export_info")
+            if not export_info:
+                continue
+            disks = export_info.get("devices", {}).get("disks")
+            if not disks:
+                continue
+            updated = False
+            for disk in disks:
+                ident = _norm_disk_id(disk)
+                if ident in shared_idents and not disk.get("shareable"):
+                    disk["shareable"] = True
+                    updated = True
+            if updated:
+                LOG.info(
+                    "Promoted shareable=True for clustered shared disk(s) in "
+                    "export_info for instance '%s' (action '%s').",
+                    instance_id, execution.action_id)
+                db_api.update_transfer_action_info_for_instance(
+                    ctxt, execution.action_id, instance_id,
+                    {"export_info": export_info})
+
     def _setup_shared_disk_volumes_info(self, ctxt, execution):
         """Sets up volumes_info for shared disks across clustered instances.
 
@@ -2799,12 +2892,7 @@ class ConductorServerEndpoint(object):
             ctxt, execution.action_id, include_task_info=True)
 
         def _get_disk_identity(disk_info):
-            disk_id = (disk_info or {}).get("id")
-            if disk_id is not None:
-                normalized = str(disk_id).strip().lower()
-                if normalized:
-                    return normalized
-            return None
+            return _cluster_disk_identity((disk_info or {}).get("id"))
 
         identity_counts = {}
         explicitly_shareable = {}
@@ -2831,10 +2919,13 @@ class ConductorServerEndpoint(object):
             return
 
         owners = {}
-        for instance_id in action.instances:
-            for ident in instance_disk_maps.get(instance_id, {}):
-                if ident in shared_identities and ident not in owners:
-                    owners[ident] = instance_id
+        instance_ids = list(action.instances)
+        for ident in shared_identities:
+            holders = [
+                i for i in instance_ids
+                if ident in instance_disk_maps.get(i, {})]
+            if holders:
+                owners[ident] = min(holders)
 
         owner_volumes_cache = {}
         for instance_id in action.instances:
@@ -2868,16 +2959,19 @@ class ConductorServerEndpoint(object):
 
                 if owner_id not in owner_volumes_cache:
                     owner_volumes_cache[owner_id] = {
-                        v.get("disk_id"): v
+                        _cluster_disk_identity(v.get("disk_id")): v
                         for v in action.info.get(owner_id, {}).get(
-                            "volumes_info", [])}
+                            "volumes_info", [])
+                        if _cluster_disk_identity(v.get("disk_id"))}
                 owner_volume = owner_volumes_cache[owner_id].get(
-                    owner_disk_id)
+                    _cluster_disk_identity(owner_disk_id))
                 if not owner_volume:
                     continue
 
+                waiter_cluster = _cluster_disk_identity(waiter_disk_id)
                 for vol in volumes_info:
-                    if vol.get("disk_id") != waiter_disk_id:
+                    if _cluster_disk_identity(vol.get("disk_id")) != (
+                            waiter_cluster):
                         continue
                     inherited = copy.deepcopy(owner_volume)
                     inherited["disk_id"] = waiter_disk_id
@@ -2903,11 +2997,13 @@ class ConductorServerEndpoint(object):
             owner_updated = False
             for vol in owner_volumes:
                 disk_id = vol.get("disk_id")
+                vol_key = _cluster_disk_identity(disk_id)
                 for ident, oid in owners.items():
                     if oid != owner_id:
                         continue
-                    if instance_disk_maps.get(owner_id, {}).get(
-                            ident) == disk_id:
+                    if _cluster_disk_identity(
+                            instance_disk_maps.get(owner_id, {}).get(
+                                ident)) == vol_key:
                         if not vol.get("shareable"):
                             vol["shareable"] = True
                             owner_updated = True
@@ -2915,6 +3011,164 @@ class ConductorServerEndpoint(object):
                 db_api.update_transfer_action_info_for_instance(
                     ctxt, execution.action_id, owner_id,
                     {"volumes_info": owner_volumes})
+
+        # Every instance that maps a volume to a clustered shared disk identity
+        # must attach with shareable=True on libvirt (QEMU multi-writer). The
+        # owner loop above can miss if disk_id strings diverge slightly; this
+        # pass keys off the same disk_map used for ownership.
+        for instance_id in action.instances:
+            disk_map = instance_disk_maps.get(instance_id, {})
+            volumes_info = action.info.get(instance_id, {}).get(
+                "volumes_info", [])
+            if not volumes_info:
+                continue
+            promoted = False
+            for vol in volumes_info:
+                disk_id = vol.get("disk_id")
+                vol_key = _cluster_disk_identity(disk_id)
+                if not vol_key:
+                    continue
+                for ident in shared_identities:
+                    if _cluster_disk_identity(disk_map.get(ident)) != vol_key:
+                        continue
+                    if not vol.get("shareable"):
+                        vol["shareable"] = True
+                        promoted = True
+                    break
+            if promoted:
+                LOG.info(
+                    "Ensured shareable=True on shared-disk volumes for "
+                    "instance '%s' before parallel minion attach.",
+                    instance_id)
+                db_api.update_transfer_action_info_for_instance(
+                    ctxt, execution.action_id, instance_id,
+                    {"volumes_info": volumes_info})
+
+        # Order volumes so shareable / non-replicated disks come first for
+        # destination attach (e.g. Libvirt+QEMU), without encoding that in
+        # each import provider.
+        action = db_api.get_action(
+            ctxt, execution.action_id, include_task_info=True)
+        for instance_id in action.instances:
+            volumes_info = action.info.get(instance_id, {}).get(
+                "volumes_info", [])
+            if not volumes_info:
+                continue
+            sorted_volumes = sorted(
+                volumes_info,
+                key=lambda v: (
+                    0
+                    if (
+                        v.get("shareable")
+                        or not v.get(
+                            constants.VOLUME_INFO_REPLICATE_DISK_DATA, True))
+                    else 1))
+            if sorted_volumes != volumes_info:
+                LOG.info(
+                    "Reordered volumes_info for attach (shareable first) for "
+                    "instance '%s'.", instance_id)
+                db_api.update_transfer_action_info_for_instance(
+                    ctxt, execution.action_id, instance_id,
+                    {"volumes_info": sorted_volumes})
+
+    def _sync_shared_disk_replicate_metadata(self, ctxt, execution, action):
+        """Align waiter volumes_info with owner after clustered REPLICATE_DISKS.
+
+        Non-owner instances skip data replication for shared disks; copy the
+        owner's change_id (and related incremental state) so the next replica
+        run uses a consistent CBT baseline.
+        """
+        def _get_disk_identity(disk_info):
+            return _cluster_disk_identity((disk_info or {}).get("id"))
+
+        identity_counts = {}
+        explicitly_shareable = {}
+        instance_disk_maps = {}
+        for instance_id in action.instances:
+            export_info = action.info.get(instance_id, {}).get(
+                "export_info", {})
+            disks = export_info.get("devices", {}).get("disks", [])
+            disk_map = {}
+            for disk in disks:
+                ident = _get_disk_identity(disk)
+                if not ident:
+                    continue
+                disk_map[ident] = disk.get("id")
+                identity_counts[ident] = identity_counts.get(ident, 0) + 1
+                if disk.get("shareable"):
+                    explicitly_shareable[ident] = True
+            instance_disk_maps[instance_id] = disk_map
+
+        shared_identities = {
+            ident for ident, count in identity_counts.items()
+            if count > 1 or explicitly_shareable.get(ident, False)}
+        if not shared_identities:
+            return
+
+        owners = {}
+        instance_ids = list(action.instances)
+        for ident in shared_identities:
+            holders = [
+                i for i in instance_ids
+                if ident in instance_disk_maps.get(i, {})]
+            if holders:
+                owners[ident] = min(holders)
+
+        def _disk_id_to_ident(disk_map, disk_id):
+            cid = _cluster_disk_identity(disk_id)
+            if cid and cid in disk_map:
+                return cid
+            want = _normalized_volume_disk_path_key(disk_id)
+            if not want:
+                return None
+            for ident, did in disk_map.items():
+                if _normalized_volume_disk_path_key(did) == want:
+                    return ident
+            return None
+
+        owner_volumes_by_disk = {}
+        for oid in set(owners.values()):
+            owner_volumes_by_disk[oid] = {
+                _cluster_disk_identity(v.get("disk_id")): v
+                for v in action.info.get(oid, {}).get("volumes_info", [])
+                if _cluster_disk_identity(v.get("disk_id"))}
+
+        for instance_id in action.instances:
+            volumes_info = action.info.get(instance_id, {}).get(
+                "volumes_info", [])
+            if not volumes_info:
+                continue
+            disk_map = instance_disk_maps.get(instance_id, {})
+            updated = False
+            for vol in volumes_info:
+                if vol.get(constants.VOLUME_INFO_REPLICATE_DISK_DATA, True):
+                    continue
+                disk_id = vol.get("disk_id")
+                ident = _disk_id_to_ident(disk_map, disk_id)
+                if not ident or ident not in shared_identities:
+                    continue
+                owner_id = owners.get(ident)
+                if not owner_id or owner_id == instance_id:
+                    continue
+                owner_disk_id = instance_disk_maps.get(owner_id, {}).get(ident)
+                if not owner_disk_id:
+                    continue
+                owner_vol = owner_volumes_by_disk.get(owner_id, {}).get(
+                    _cluster_disk_identity(owner_disk_id))
+                if not owner_vol:
+                    continue
+                if "change_id" in owner_vol and (
+                        vol.get("change_id") != owner_vol["change_id"]):
+                    vol["change_id"] = owner_vol["change_id"]
+                    updated = True
+            if updated:
+                LOG.info(
+                    "Synced shared-disk change_id from owner for instance '%s' "
+                    "after clustered REPLICATE_DISKS barrier.",
+                    instance_id)
+                db_api.update_transfer_action_info_for_instance(
+                    ctxt, execution.action_id, instance_id,
+                    {"volumes_info": volumes_info})
 
     def _handle_task_sync_barrier(self, ctxt, task, execution, action):
         """Implements a cross-instance sync barrier for clustered actions.
@@ -2979,8 +3233,14 @@ class ConductorServerEndpoint(object):
         reached SYNCING. The handler can inspect and modify action info
         (e.g. volumes_info) for all instances.
         """
-        if task_type == constants.TASK_TYPE_DEPLOY_TRANSFER_DISKS:
+        if task_type == constants.TASK_TYPE_GET_INSTANCE_INFO:
+            self._promote_clustered_shared_disk_shareable_in_export_info(
+                ctxt, execution)
+        elif task_type == constants.TASK_TYPE_DEPLOY_TRANSFER_DISKS:
             self._setup_shared_disk_volumes_info(ctxt, execution)
+        elif task_type == constants.TASK_TYPE_REPLICATE_DISKS:
+            self._sync_shared_disk_replicate_metadata(
+                ctxt, execution, action)
 
     def _handle_post_task_actions(self, ctxt, task, execution, task_info):
         task_type = task.task_type
@@ -3257,11 +3517,11 @@ class ConductorServerEndpoint(object):
             if task.status != constants.TASK_STATUS_RUNNING:
                 LOG.warn(
                     "Just-completed task '%s' was in '%s' state instead of "
-                    "the expected '%s' state.",
-                    task_id, task.status, constants.TASK_STATUS_RUNNING)
-
-        db_api.set_task_status(
-            ctxt, task_id, constants.TASK_STATUS_COMPLETED)
+                    "the expected '%s' state. Marking as '%s' anyway.",
+                    task_id, task.status, constants.TASK_STATUS_RUNNING,
+                    constants.TASK_STATUS_COMPLETED)
+            db_api.set_task_status(
+                ctxt, task_id, constants.TASK_STATUS_COMPLETED)
 
         execution = db_api.get_tasks_execution(ctxt, task.execution_id)
         with lockutils.lock(
@@ -3533,8 +3793,12 @@ class ConductorServerEndpoint(object):
                         "Some tasks are running in parallel with the "
                         "OSMorphing task, a debug setup cannot be safely "
                         "achieved. Proceeding with cleanup tasks as usual.")
+                    self._abort_peer_sync_barrier_tasks_on_error(
+                        ctxt, execution, task, exception_details)
                     self._cancel_tasks_execution(ctxt, execution)
             else:
+                self._abort_peer_sync_barrier_tasks_on_error(
+                    ctxt, execution, task, exception_details)
                 self._cancel_tasks_execution(ctxt, execution)
 
     @task_synchronized

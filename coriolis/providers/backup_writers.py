@@ -5,6 +5,7 @@ import abc
 import base64
 import contextlib
 import copy
+import inspect
 import datetime
 import errno
 import os
@@ -14,10 +15,13 @@ import threading
 import time
 import uuid
 
+from urllib.parse import quote
+
 import eventlet
 from oslo_config import cfg
 from oslo_log import log as logging
 import paramiko
+import requests
 from six import with_metaclass
 
 from coriolis import constants
@@ -65,6 +69,20 @@ _WRITER_ERR_MAP = {
     14: "ERR_WRITE_MSG_ID",
     15: "ERR_OUT_OF_BOUDS",
 }
+
+
+def _http_writer_device_path_segment(path):
+    """Primary device id segment for /api/v2/device/<segment>/… (standard base64)."""
+    return base64.b64encode(path.encode("utf-8")).decode()
+
+
+def _http_writer_device_path_segment_strategies(path):
+    """Ordered encodings to try against coriolis-writer (image / version quirks)."""
+    std = _http_writer_device_path_segment(path)
+    return [
+        ("b64_standard", std),
+        ("b64_standard_url_quoted", quote(std, safe="")),
+    ]
 
 
 def _disable_lvm2_lvmetad(ssh):
@@ -559,6 +577,7 @@ class HTTPBackupWriterImpl(BaseBackupWriterImpl):
         self._compress_transfer = compress_transfer
         if self._compress_transfer is None:
             self._compress_transfer = CONF.compress_transfers
+        self._resolved_device_segment = None
         super(HTTPBackupWriterImpl, self).__init__(path, disk_id)
 
     def _set_info(self, info):
@@ -575,21 +594,48 @@ class HTTPBackupWriterImpl(BaseBackupWriterImpl):
 
     @property
     def _uri(self):
-        b64_path = base64.b64encode(self._path.encode()).decode()
+        seg = (
+            self._resolved_device_segment
+            if self._resolved_device_segment is not None
+            else _http_writer_device_path_segment(self._path))
         return "https://%s:%s/api/v2/device/%s" % (
-            self._ip, self._port, b64_path
-        )
+            self._ip, self._port, seg)
 
-    @utils.retry_on_error()
+    @utils.retry_on_error(terminal_exceptions=(exception.CoriolisException,))
     def _acquire(self):
         self._ensure_session()
-        uri = "%s/acquire" % self._uri
         headers = {"X-Client-Token": self._id}
-        resp = self._session.post(
-            uri, headers=headers, timeout=CONF.default_requests_timeout)
-        LOG.debug("Returned code: %d. Msg: %s" % (
-            resp.status_code, resp.content))
-        resp.raise_for_status()
+        last_resp = None
+        for enc_name, seg in _http_writer_device_path_segment_strategies(
+                self._path):
+            uri = "https://%s:%s/api/v2/device/%s/acquire" % (
+                self._ip, self._port, seg)
+            resp = self._session.post(
+                uri, headers=headers, timeout=CONF.default_requests_timeout)
+            last_resp = resp
+            LOG.debug(
+                "HTTP backup writer acquire (%(enc)s): %(code)s for %(uri)s. "
+                "Msg: %(msg)s",
+                {"enc": enc_name, "code": resp.status_code, "uri": uri,
+                 "msg": resp.content})
+            if resp.status_code == 404:
+                continue
+            try:
+                resp.raise_for_status()
+            except requests.exceptions.HTTPError:
+                LOG.exception(
+                    "HTTP backup writer acquire failed for path %s", self._path)
+                raise
+            self._resolved_device_segment = seg
+            return
+
+        raise exception.CoriolisException(
+            "The HTTPS backup writer on the minion rejected all device path "
+            "encodings (HTTP 404). This usually means an outdated binary or "
+            "another service is listening on the writer port. Try "
+            "data_transfer_mechanism SSH, upgrade the coriolis-writer shipped "
+            "with the Coriolis worker, or redeploy the minion image. "
+            "Last response: %r" % (getattr(last_resp, "content", b""),))
 
     @utils.retry_on_error()
     def _release(self):
@@ -600,6 +646,11 @@ class HTTPBackupWriterImpl(BaseBackupWriterImpl):
             uri, headers=headers, timeout=CONF.default_requests_timeout)
         LOG.debug("Returned code: %d. Msg: %s" %
                   (resp.status_code, resp.content))
+        if resp.status_code == 404:
+            LOG.debug(
+                "HTTP backup writer release returned 404 for %s; ignoring.",
+                self._path)
+            return
         resp.raise_for_status()
 
     def _init_session(self):
@@ -693,9 +744,17 @@ class HTTPBackupWriterImpl(BaseBackupWriterImpl):
                     resp.raise_for_status()
                     self._write_error = False
                 except Exception as err:
+                    preview = ""
+                    try:
+                        txt = resp.text
+                        preview = (txt[:512] + "...") if len(txt) > 512 else txt
+                    except Exception:
+                        preview = repr(getattr(resp, "content", b"")[:512])
                     LOG.warning(
                         "Error writing chunk to disk %s at offset"
-                        " %s: %s" % (self._path, payload["offset"], err))
+                        " %s: %s (status=%s body_preview=%r)" % (
+                            self._path, payload["offset"], err,
+                            getattr(resp, "status_code", None), preview))
                     self._write_error = True
                     raise
             try:
@@ -836,15 +895,20 @@ class HTTPBackupWriterBootstrapper(object):
     def _copy_writer(self, ssh):
         local_path = os.path.join(
             utils.get_resources_bin_dir(), _CORIOLIS_HTTP_WRITER_CMD)
+        if not os.path.isfile(local_path):
+            raise exception.CoriolisException(
+                "HTTP backup writer binary is missing on the Coriolis worker "
+                "at '%s'. Install the package that ships coriolis-writer in "
+                "coriolis/resources/bin/." % local_path)
         remote_tmp_path = os.path.join("/tmp", _CORIOLIS_HTTP_WRITER_CMD)
         with self._lock:
             sftp = ssh.open_sftp()
             try:
-                # Check if the remote file already exists
-                sftp.stat(self._writer_cmd)
-            except IOError as ex:
-                if ex.errno != errno.ENOENT:
-                    raise
+                # Golden minion images often ship an older coriolis-writer.
+                # Skipping upload breaks acquire/release (HTTP 404 on /api/v2/...).
+                LOG.info(
+                    "Syncing coriolis-writer from worker to minion at %s.",
+                    self._writer_cmd)
                 sftp.put(local_path, remote_tmp_path)
                 utils.exec_ssh_cmd(
                     ssh,
@@ -927,14 +991,29 @@ class HTTPBackupWriterBootstrapper(object):
                        "listen_port": self._writer_port,
         }
         self._change_binary_se_context(ssh)
+        _cs_params = inspect.signature(utils.create_service).parameters
+        _cs_kw = {"start": True}
+        if "force_update" in _cs_params:
+            _cs_kw["force_update"] = True
         utils.create_service(
-            ssh, cmdline, _CORIOLIS_HTTP_WRITER_CMD, start=True)
+            ssh, cmdline, _CORIOLIS_HTTP_WRITER_CMD, **_cs_kw)
+        # create_service skips writing the unit if it already exists on the
+        # image and does not restart an existing service. After replacing the
+        # binary we must run the new process (and recover if stop left it down).
+        utils.restart_service(ssh, _CORIOLIS_HTTP_WRITER_CMD)
         self._inject_dport_allow_rule(ssh)
         self._add_firewalld_port(ssh)
 
     def setup_writer(self):
         _disable_lvm_metad_udev_rule(self._ssh)
         _disable_lvm2_lvmetad(self._ssh)
+        # Do not use utils.stop_service here: it retries 5x on failure, and
+        # "Unit not loaded" (exit 5) is normal on a first-time minion image.
+        utils.exec_ssh_cmd(
+            self._ssh,
+            "sudo bash -lc 'systemctl stop %s 2>/dev/null || true'" % (
+                _CORIOLIS_HTTP_WRITER_CMD),
+            get_pty=True)
         self._copy_writer(self._ssh)
         paths = utils.retry_on_error()(
             self._setup_certificates)(self._ssh)
