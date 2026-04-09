@@ -125,9 +125,18 @@
                   "type": "string"
                 },
                 "description": "Identifiers which previous versions of the source provider may have reported as this disk's 'id' (e.g. the VMware provider moving from per-VM device keys to virtual disk UUIDs). Used to migrate the 'disk_id' fields of pre-existing replicas' volumes_info to the current identifier."
+              },
+              "shareable": {
+                "type": "boolean",
+                "description": "Whether the disk is shared (multi-writer) and can be attached to multiple VMs simultaneously."
+              },
+              "owner": {
+                "type": "string",
+                "description": "The identifier of the instance owning this disk within a clustered (multi-instance) transfer. Set by the conductor after all GET_INSTANCE_INFO tasks have synced. For shared disks, only the owner instance's tasks create/replicate the corresponding destination volume; other instances only reference it."
               }
             },
             "required": [
+              "id",
               "size_bytes"
             ]
           }
