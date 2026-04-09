@@ -23,6 +23,38 @@ def _get_volumes_info(task_info):
     return volumes_info
 
 
+def _preserve_replicate_disk_data_from_prior_volumes(
+        prior_volumes_info, new_volumes_info):
+    """Keep replicate_disk_data=False set by the conductor for cluster waiters.
+
+    update_transfer_action_info_for_instance replaces the whole
+    volumes_info list when a task returns. Destination deploy does not
+    round-trip that flag, so shared-disk waiters would lose it and replicate
+    again unless we merge it back per disk_id.
+    """
+    if not prior_volumes_info or not new_volumes_info:
+        return new_volumes_info
+    key = constants.VOLUME_INFO_REPLICATE_DISK_DATA
+    by_disk = {}
+    for v in prior_volumes_info:
+        if not isinstance(v, dict):
+            continue
+        did = v.get("disk_id")
+        if did is None:
+            continue
+        by_disk[str(did)] = v
+    for vol in new_volumes_info:
+        if not isinstance(vol, dict):
+            continue
+        did = vol.get("disk_id")
+        if did is None:
+            continue
+        prev = by_disk.get(str(did))
+        if prev and prev.get(key) is False:
+            vol[key] = False
+    return new_volumes_info
+
+
 def _check_ensure_volumes_info_ordering(export_info, volumes_info):
     """ Returns a new list of volumes_info, ensuring that the order of
     the disks in 'volumes_info' is consistent with the order that the
@@ -244,12 +276,27 @@ class ReplicateDisksTask(base.TaskRunner):
         source_environment = task_info['source_environment']
 
         source_resources = task_info.get('source_resources', {})
-        volumes_info = provider.replicate_disks(
-            ctxt, connection_info, source_environment, instance,
-            source_resources, migr_source_conn_info, migr_target_conn_info,
-            volumes_info, incremental)
-        schemas.validate_value(
-            volumes_info, schemas.CORIOLIS_VOLUMES_INFO_SCHEMA)
+        volumes_to_replicate = [
+            vol for vol in volumes_info
+            if vol.get(constants.VOLUME_INFO_REPLICATE_DISK_DATA, True)]
+        pre_replicated_volumes = [
+            vol for vol in volumes_info
+            if not vol.get(constants.VOLUME_INFO_REPLICATE_DISK_DATA, True)]
+
+        if volumes_to_replicate:
+            replicated_volumes = provider.replicate_disks(
+                ctxt, connection_info, source_environment, instance,
+                source_resources, migr_source_conn_info, migr_target_conn_info,
+                volumes_to_replicate, incremental)
+            schemas.validate_value(
+                replicated_volumes, schemas.CORIOLIS_VOLUMES_INFO_SCHEMA)
+        else:
+            LOG.info(
+                "No disks marked for replication for instance '%s'. "
+                "Using pre-provisioned volumes_info.", instance)
+            replicated_volumes = []
+
+        volumes_info = pre_replicated_volumes + replicated_volumes
 
         volumes_info = _check_ensure_volumes_info_ordering(
             export_info, volumes_info)
@@ -290,15 +337,17 @@ class DeployReplicaDisksTask(base.TaskRunner):
             event_handler)
         connection_info = base.get_connection_info(ctxt, destination)
 
-        volumes_info = task_info.get("volumes_info", [])
+        prior_volumes_info = task_info.get("volumes_info", [])
         volumes_info = provider.deploy_replica_disks(
             ctxt, connection_info, target_environment, instance, export_info,
-            volumes_info)
+            prior_volumes_info)
         schemas.validate_value(
             volumes_info, schemas.CORIOLIS_VOLUMES_INFO_SCHEMA)
 
         volumes_info = _check_ensure_volumes_info_ordering(
             export_info, volumes_info)
+        volumes_info = _preserve_replicate_disk_data_from_prior_volumes(
+            prior_volumes_info, volumes_info)
 
         return {
             'volumes_info': volumes_info}

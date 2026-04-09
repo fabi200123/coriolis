@@ -477,6 +477,12 @@ class _BaseAttachVolumesToTransferMinionTask(
     def _get_volumes_info_from_task_info(cls, task_info):
         return task_info["volumes_info"]
 
+    def _run(
+            self, ctxt, instance, origin, destination, task_info,
+            event_handler):
+        return super(_BaseAttachVolumesToTransferMinionTask, self)._run(
+            ctxt, instance, origin, destination, task_info, event_handler)
+
     @classmethod
     def get_required_task_info_properties(cls):
         fields = super(

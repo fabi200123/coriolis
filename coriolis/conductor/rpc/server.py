@@ -740,6 +740,11 @@ class ConductorServerEndpoint(object):
                         ctxt, task, origin_endpoint, destination_endpoint,
                         retry_count=scheduling_retry_count,
                         retry_period=scheduling_retry_period)
+                    instance_task_info = task_info.get(task.instance, {})
+                    # NOTE: keep task_info in line with what we store after
+                    # update_transfer_action_info_for_instance
+                    # (export vs volumes)
+                    utils.sync_instance_volumes_with_export(instance_task_info)
                     worker_rpc.begin_task(
                         ctxt,
                         task_id=task.id,
@@ -747,7 +752,7 @@ class ConductorServerEndpoint(object):
                         origin=origin,
                         destination=destination,
                         instance=task.instance,
-                        task_info=task_info.get(task.instance, {}))
+                        task_info=instance_task_info)
                 except Exception:
                     LOG.warn(
                         "Error occured while starting new task '%s'. "
@@ -771,6 +776,42 @@ class ConductorServerEndpoint(object):
                 "No tasks were started at the beginning of execution '%s'" % (
                     execution.id))
 
+    @staticmethod
+    def _apply_clustered_replicate_peer_deploy_dependencies(
+        transfer, execution
+    ):
+        """Order REPLICATE_DISKS after every peer's DEPLOY_TRANSFER_DISKS.
+
+        For clustered transfers, deploy populates volumes_info (including
+        replicate_disk_data for shared disks). Without this, a waiter's
+        REPLICATE_DISKS can start before another instance's deploy finishes,
+        so both sides still replicate.
+        """
+        if not getattr(transfer, "clustered", False):
+            return
+        if len(transfer.instances) < 2:
+            return
+        deploy_id_by_instance = {
+            t.instance: t.id for t in execution.tasks
+            if t.task_type == constants.TASK_TYPE_DEPLOY_TRANSFER_DISKS}
+        for t in execution.tasks:
+            if t.task_type != constants.TASK_TYPE_REPLICATE_DISKS:
+                continue
+            seen = set()
+            new_deps = []
+            for dep_id in (t.depends_on or []):
+                if dep_id not in seen:
+                    seen.add(dep_id)
+                    new_deps.append(dep_id)
+            for inst in transfer.instances:
+                if inst == t.instance:
+                    continue
+                peer_deploy_id = deploy_id_by_instance.get(inst)
+                if peer_deploy_id and peer_deploy_id not in seen:
+                    seen.add(peer_deploy_id)
+                    new_deps.append(peer_deploy_id)
+            t.depends_on = new_deps
+
     def _check_execution_tasks_sanity(
             self, execution, initial_task_info):
         """ Checks whether the given execution's tasks are:
@@ -779,10 +820,10 @@ class ConductorServerEndpoint(object):
         """
         all_instances_in_tasks = {
             t.instance for t in execution.tasks}
-        instances_tasks_mapping = {
-            instance: [
-                t for t in execution.tasks if t.instance == instance]
-            for instance in all_instances_in_tasks}
+        if not all_instances_in_tasks:
+            return
+        if initial_task_info is None:
+            initial_task_info = {}
 
         def _check_task_cls_param_requirements(task, instance_task_info_keys):
             task_cls = tasks_factory.get_task_runner_class(task.task_type)
@@ -798,108 +839,85 @@ class ConductorServerEndpoint(object):
                         missing_params))
             return task_cls.get_returned_task_info_properties()
 
-        for instance, instance_tasks in instances_tasks_mapping.items():
-            task_info_keys = set(initial_task_info.get(
-                instance, {}).keys())
-            # mapping between the ID and associated object of processed tasks:
-            processed_tasks = {}
-            tasks_to_process = {
-                t.id: t for t in instance_tasks}
-            while tasks_to_process:
-                queued_tasks = []
-                # gather all tasks which will be queued to run in parallel:
-                for task in tasks_to_process.values():
-                    if task.status in (
-                            constants.TASK_STATUS_SCHEDULED,
-                            constants.TASK_STATUS_ON_ERROR_ONLY):
-                        if not task.depends_on:
-                            queued_tasks.append(task)
-                        else:
-                            missing_deps = [
-                                dep_id
-                                for dep_id in task.depends_on
-                                if dep_id not in tasks_to_process and (
-                                    dep_id not in processed_tasks)]
-                            if missing_deps:
-                                raise exception.TaskDependencyException(
-                                    "Task '%s' (type '%s') for instance '%s' "
-                                    "has non-existent tasks referenced as "
-                                    "dependencies: %s" % (
-                                        task.id, task.task_type,
-                                        instance, missing_deps))
-                            if all(
-                                    [dep_id in processed_tasks
-                                     for dep_id in task.depends_on]):
-                                queued_tasks.append(task)
-                    else:
-                        raise exception.InvalidTaskState(
-                            "Invalid initial state '%s' for task '%s' "
-                            "of type '%s'." % (
-                                task.status, task.id, task.task_type))
+        all_tasks_by_id = {t.id: t for t in execution.tasks}
+        task_info_by_instance = {
+            inst: set((initial_task_info.get(inst) or {}).keys())
+            for inst in all_instances_in_tasks}
 
-                # check if nothing was left queued:
-                if not queued_tasks:
-                    remaining_tasks_deps_map = {
-                        (tid, t.task_type): t.depends_on
-                        for tid, t in tasks_to_process.items()}
-                    processed_tasks_type_map = {
-                        tid: t.task_type
-                        for tid, t in processed_tasks.items()}
-                    raise exception.ExecutionDeadlockException(
-                        "Execution '%s' (type '%s') is bound to be deadlocked:"
-                        " there are leftover tasks for instance '%s' which "
-                        "will never get queued. Already processed tasks are: "
-                        "%s. Tasks left: %s" % (
-                            execution.id, execution.type, instance,
-                            processed_tasks_type_map, remaining_tasks_deps_map
-                        ))
+        tasks_to_process = {t.id: t for t in execution.tasks}
+        if not tasks_to_process:
+            return
+        processed_tasks = {}
+        while tasks_to_process:
+            queued_tasks = []
+            for task in tasks_to_process.values():
+                if task.status not in (
+                        constants.TASK_STATUS_SCHEDULED,
+                        constants.TASK_STATUS_ON_ERROR_ONLY):
+                    raise exception.InvalidTaskState(
+                        "Invalid initial state '%s' for task '%s' "
+                        "of type '%s'." % (
+                            task.status, task.id, task.task_type))
+                if not task.depends_on:
+                    queued_tasks.append(task)
+                else:
+                    dep_ids = list(task.depends_on)
+                    missing = [
+                        dep_id for dep_id in dep_ids
+                        if dep_id not in all_tasks_by_id]
+                    if missing:
+                        raise exception.TaskDependencyException(
+                            "Task '%s' (type '%s') for instance '%s' "
+                            "has non-existent tasks referenced as "
+                            "dependencies: %s" % (
+                                task.id, task.task_type, task.instance,
+                                missing))
+                    if all(
+                            dep_id in processed_tasks
+                            for dep_id in dep_ids):
+                        queued_tasks.append(task)
 
-                # mapping for task_info fields modified by each task:
-                modified_fields_by_queued_tasks = {}
-                # check that each task has what it needs and
-                # register what they return/modify:
-                for task in queued_tasks:
-                    for new_field in _check_task_cls_param_requirements(
-                            task, task_info_keys):
-                        if new_field not in modified_fields_by_queued_tasks:
-                            modified_fields_by_queued_tasks[new_field] = [
-                                task]
-                        else:
-                            modified_fields_by_queued_tasks[new_field].append(
-                                task)
+            if not queued_tasks:
+                raise exception.ExecutionDeadlockException(
+                    "Execution '%s' (type '%s') is bound to be deadlocked: "
+                    "cannot schedule a next wave. Remaining: %s. "
+                    "Processed: %s" % (
+                        execution.id, execution.type,
+                        {t.id: t.depends_on
+                         for t in tasks_to_process.values()},
+                        list(processed_tasks)))
 
-                # check if any queued tasks would manipulate the same fields:
-                conflicting_fields = {
-                    new_field: [t.task_type for t in tasks]
-                    for new_field, tasks in (
-                        modified_fields_by_queued_tasks.items())
-                    if len(tasks) > 1}
-                if conflicting_fields:
-                    raise exception.TaskFieldsConflict(
-                        "There are fields which will encounter a state "
-                        "conflict following the parallelized execution of "
-                        "tasks for execution '%s' (type '%s') for instance "
-                        "'%s'. Conflicting fields and tasks will be: : %s" % (
-                            execution.id, execution.type, instance,
-                            conflicting_fields))
+            new_fields_by_task = {}
+            for task in queued_tasks:
+                new_fields_by_task[task] = _check_task_cls_param_requirements(
+                    task, task_info_by_instance[task.instance])
+            modified_by_inst_field = {}
+            for task, new_fields in new_fields_by_task.items():
+                for new_field in new_fields:
+                    key = (task.instance, new_field)
+                    modified_by_inst_field.setdefault(key, []).append(task)
+            conflicts = {
+                (inst, field): [t.task_type for t in tlist]
+                for (inst, field), tlist in modified_by_inst_field.items()
+                if len(tlist) > 1}
+            if conflicts:
+                raise exception.TaskFieldsConflict(
+                    "There are fields which will encounter a state "
+                    "conflict for execution '%s' (type '%s') (instance+field) "
+                    "and tasks: %s" % (
+                        execution.id, execution.type, conflicts))
 
-                # register queued tasks as processed before continuing:
-                for task in queued_tasks:
-                    processed_tasks[task.id] = task
-                    tasks_to_process.pop(task.id)
-                # update current state fields at this point:
-                task_info_keys = task_info_keys.union(set(
-                    modified_fields_by_queued_tasks.keys()))
-                LOG.debug(
-                    "Successfully processed following tasks for instance '%s' "
-                    "for execution %s (type '%s') for any state conflict "
-                    "checks: %s", instance, execution.id, execution.type,
-                    [(t.id, t.task_type) for t in queued_tasks])
+            for _task, new_fields in new_fields_by_task.items():
+                for new_field in new_fields:
+                    task_info_by_instance[_task.instance].add(new_field)
+            for task in queued_tasks:
+                processed_tasks[task.id] = task
+                tasks_to_process.pop(task.id, None)
             LOG.debug(
-                "Successfully checked all tasks for instance '%s' as part of "
-                "execution '%s' (type '%s') for any state conflicts: %s",
-                instance, execution.id, execution.type,
-                [(t.id, t.task_type) for t in instance_tasks])
+                "Sanity check wave for execution '%s': %s",
+                execution.id,
+                [(t.id, t.task_type, t.instance) for t in queued_tasks])
+
         LOG.debug(
             "Successfully checked all tasks for execution '%s' (type '%s') "
             "for ordering or state conflicts.",
@@ -927,6 +945,11 @@ class ConductorServerEndpoint(object):
         dest_env = copy.deepcopy(transfer.destination_environment)
         dest_env['network_map'] = transfer.network_map
         dest_env['storage_mappings'] = transfer.storage_mappings
+
+        # Serialized DEPLOY for clustered transfers so the first instance
+        # (owner) materializes libvirt volumes before other instances run
+        # deploy_replica_disks; _setup can then copy pool/volume to waiters.
+        prev_clustered_deploy_task_id = None
 
         for instance in execution.action.instances:
             # NOTE: we default/convert the volumes info to an empty list
@@ -1010,9 +1033,16 @@ class ConductorServerEndpoint(object):
                 disk_deployment_depends_on.append(
                     validate_transfer_destination_inputs_task.id)
 
+            disk_deploy_deps = list(disk_deployment_depends_on)
+            if (
+                    getattr(transfer, "clustered", False)
+                    and prev_clustered_deploy_task_id is not None):
+                disk_deploy_deps.append(prev_clustered_deploy_task_id)
             deploy_transfer_disks_task = self._create_task(
                 instance, constants.TASK_TYPE_DEPLOY_TRANSFER_DISKS,
-                execution, depends_on=disk_deployment_depends_on)
+                execution, depends_on=disk_deploy_deps)
+            if getattr(transfer, "clustered", False):
+                prev_clustered_deploy_task_id = deploy_transfer_disks_task.id
 
             shutdown_deps = []
             deploy_transfer_source_resources_task = None
@@ -1097,6 +1127,8 @@ class ConductorServerEndpoint(object):
                         replicate_disks_task.id],
                     on_error=True)
 
+        self._apply_clustered_replicate_peer_deploy_dependencies(
+            transfer, execution)
         self._check_execution_tasks_sanity(execution, transfer.info)
 
         # update the action info for all of the Transfers:
@@ -1294,6 +1326,7 @@ class ConductorServerEndpoint(object):
                                   network_map, storage_mappings, notes=None,
                                   user_scripts=None, clone_disks=True,
                                   skip_os_morphing=False):
+        clustered = len(instances) > 1
         supported_scenarios = [
             constants.TRANSFER_SCENARIO_REPLICA,
             constants.TRANSFER_SCENARIO_LIVE_MIGRATION]
@@ -1330,6 +1363,7 @@ class ConductorServerEndpoint(object):
         transfer.user_scripts = user_scripts or {}
         transfer.clone_disks = clone_disks
         transfer.skip_os_morphing = skip_os_morphing
+        transfer.clustered = clustered
 
         self._check_minion_pools_for_action(ctxt, transfer)
 
@@ -1738,6 +1772,7 @@ class ConductorServerEndpoint(object):
         deployment.user_scripts = user_scripts
         deployment.clone_disks = clone_disks
         deployment.skip_os_morphing = skip_os_morphing
+        deployment.clustered = bool(getattr(transfer, 'clustered', False))
         deployment.deployer_id = wait_for_execution
         deployment.trust_id = trust_id
         deployment.last_execution_status = init_status
@@ -2089,13 +2124,15 @@ class ConductorServerEndpoint(object):
                     exception_details=(
                         "This task was unscheduled during the cancellation "
                         "of the parent tasks execution."))
+            # NOTE: SYNCING covers tasks waiting on a clustered
+            # barrier; there is no running worker to cancel, so we
+            # unschedule like PENDING/STARTING. (Peers stuck in
+            # SYNCING when another instance fails are handled in
+            # _abort_peer_sync_barrier_tasks_on_error, not here.)
             elif task.status in (
                     constants.TASK_STATUS_PENDING,
-                    constants.TASK_STATUS_STARTING):
-                # any PENDING/STARTING tasks means that they did not have a
-                # host assigned to them yet, and presuming the host does not
-                # start executing the task until it marks itself as the runner,
-                # we can just mark the task as unscheduled:
+                    constants.TASK_STATUS_STARTING,
+                    constants.TASK_STATUS_SYNCING):
                 LOG.debug(
                     "Setting currently '%s' task '%s' to '%s' as part of the "
                     "cancellation of execution '%s'",
@@ -2184,6 +2221,30 @@ class ConductorServerEndpoint(object):
             LOG.debug(
                 "No new tasks were started for execution '%s' following "
                 "state advancement after cancellation.", execution.id)
+
+    def _abort_peer_sync_barrier_tasks_on_error(
+            self, ctxt, execution, errored_task, error_message):
+        """Mark peer tasks stuck in SYNCING on the same barrier as failed."""
+        if errored_task.task_type not in constants.TASK_TYPES_TO_SYNC:
+            return
+        action = db_api.get_action(
+            ctxt, execution.action_id, include_task_info=True)
+        if not bool(getattr(action, "clustered", False)):
+            return
+        execution = db_api.get_tasks_execution(ctxt, execution.id)
+        for peer in execution.tasks:
+            if peer.id == errored_task.id:
+                continue
+            if peer.status != constants.TASK_STATUS_SYNCING:
+                continue
+            if peer.task_type != errored_task.task_type:
+                continue
+            db_api.set_task_status(
+                ctxt, peer.id, constants.TASK_STATUS_ERROR,
+                exception_details=(
+                    "Aborted: peer task '%s' failed during clustered "
+                    "execution. Original error: %s" % (
+                        errored_task.id, error_message)))
 
     def _update_reservation_fulfillment_for_execution(self, ctxt, execution):
         """ Updates the reservation fulfillment status for the parent
@@ -2548,6 +2609,8 @@ class ConductorServerEndpoint(object):
                 task_info = {}
             else:
                 task_info = action.info[task.instance]
+            # NOTE: same sync as in update_transfer_action_info_for_instance
+            utils.sync_instance_volumes_with_export(task_info)
             db_api.set_task_status(
                 ctxt, task.id, constants.TASK_STATUS_PENDING)
             try:
@@ -2781,6 +2844,323 @@ class ConductorServerEndpoint(object):
                 "restore during deployment. transfer id: %s", transfer_id)
             self._update_transfer_volumes_info(
                 ctxt, transfer_id, instance, updated_task_info)
+
+    def _clustered_shared_disk_export_maps(self, action):
+        """Build per-instance export disk maps and shared cluster identities.
+
+        Returns ``(instance_disk_maps, shared_identities)`` where each
+        ``instance_disk_maps[instance_id]`` maps ``cluster_disk_identity``
+        to that disk's export ``id`` from ``export_info``.
+        """
+        identity_counts = {}
+        explicitly_shareable = {}
+        instance_disk_maps = {}
+        for instance_id in action.instances:
+            export_info = action.info.get(instance_id, {}).get(
+                "export_info", {})
+            disks = export_info.get("devices", {}).get("disks", [])
+            disk_map = {}
+            for disk in disks:
+                ident = utils.cluster_disk_identity(disk or {})
+                if not ident:
+                    continue
+                disk_map[ident] = disk.get("id")
+                identity_counts[ident] = identity_counts.get(ident, 0) + 1
+                if disk.get("shareable"):
+                    explicitly_shareable[ident] = True
+            instance_disk_maps[instance_id] = disk_map
+
+        shared_identities = {
+            ident for ident, count in identity_counts.items()
+            if count > 1 or explicitly_shareable.get(ident, False)}
+        return instance_disk_maps, shared_identities
+
+    def _clustered_shared_disk_owners(
+            self, instance_disk_maps, shared_identities, instance_order):
+        """Pick one owner instance per shared disk identity.
+
+        The owner is the first entry in ``instance_order`` (transfer instance
+        list order) that has that disk in ``instance_disk_maps``.
+        """
+        owners = {}
+        for ident in shared_identities:
+            for inst in instance_order:
+                if ident in instance_disk_maps.get(inst, {}):
+                    owners[ident] = inst
+                    break
+        return owners
+
+    def _promote_clustered_shared_disk_shareable_in_export_info(
+            self, ctxt, execution):
+        """Promote shareable on export disks when clustered and shared."""
+        action = db_api.get_action(
+            ctxt, execution.action_id, include_task_info=True)
+        if not getattr(action, "clustered", False):
+            return
+        if not action.instances:
+            return
+
+        _, shared_idents = self._clustered_shared_disk_export_maps(action)
+        if not shared_idents:
+            return
+
+        for instance_id in action.instances:
+            export_info = action.info.get(instance_id, {}).get("export_info")
+            if not export_info:
+                continue
+            disks = export_info.get("devices", {}).get("disks")
+            if not disks:
+                continue
+            updated = False
+            for disk in disks:
+                ident = utils.cluster_disk_identity(disk or {})
+                if ident in shared_idents and not disk.get("shareable"):
+                    disk["shareable"] = True
+                    updated = True
+            if updated:
+                LOG.info(
+                    "Promoted shareable=True for clustered shared disk(s) in "
+                    "export_info for instance '%s' (action '%s').",
+                    instance_id, execution.action_id)
+                db_api.update_transfer_action_info_for_instance(
+                    ctxt, execution.action_id, instance_id,
+                    {"export_info": export_info})
+
+    def _setup_shared_disk_volumes_info(self, ctxt, execution):
+        """Configure volumes_info for shared disks before parallel replicate.
+
+        After the DEPLOY_TRANSFER_DISKS sync barrier, non-owner instances get
+        ``replicate_disk_data=False`` and inherit the owner's volume entry;
+        ``shareable`` is set where needed.
+        """
+        action = db_api.get_action(
+            ctxt, execution.action_id, include_task_info=True)
+
+        instance_disk_maps, shared_identities = (
+            self._clustered_shared_disk_export_maps(action))
+        if not shared_identities:
+            return
+
+        owners = self._clustered_shared_disk_owners(
+            instance_disk_maps, shared_identities, action.instances)
+
+        owner_volumes_cache = {}
+        for instance_id in action.instances:
+            disk_map = instance_disk_maps.get(instance_id, {})
+            shared_idents_for_inst = [
+                i for i in disk_map if i in shared_identities]
+            if not shared_idents_for_inst:
+                continue
+
+            is_owner_for_all = all(
+                owners.get(i) == instance_id for i in shared_idents_for_inst)
+            if is_owner_for_all:
+                continue
+
+            volumes_info = list(
+                action.info.get(instance_id, {}).get("volumes_info", []) or [])
+
+            updated = False
+            for ident in shared_idents_for_inst:
+                owner_id = owners.get(ident)
+                if owner_id == instance_id or not owner_id:
+                    continue
+
+                waiter_disk_id = disk_map[ident]
+                owner_disk_id = instance_disk_maps.get(
+                    owner_id, {}).get(ident)
+                if not owner_disk_id:
+                    continue
+
+                if owner_id not in owner_volumes_cache:
+                    owner_volumes_cache[owner_id] = {
+                        utils.cluster_disk_identity(v): v
+                        for v in action.info.get(owner_id, {}).get(
+                            "volumes_info", [])
+                        if utils.cluster_disk_identity(v)}
+                owner_volume = owner_volumes_cache[owner_id].get(ident)
+                if not owner_volume:
+                    continue
+
+                inherited = copy.deepcopy(owner_volume)
+                inherited["disk_id"] = waiter_disk_id
+                inherited[
+                    constants.VOLUME_INFO_REPLICATE_DISK_DATA] = False
+                inherited["shareable"] = True
+                inherited["volume_dev"] = ""
+
+                target_vol = None
+                for vol in volumes_info:
+                    if utils.cluster_disk_identity(vol) == ident:
+                        target_vol = vol
+                        break
+                if target_vol is None:
+                    norm_wid = utils.normalized_volume_disk_path_key(
+                        waiter_disk_id)
+                    for vol in volumes_info:
+                        if utils.normalized_volume_disk_path_key(
+                                vol.get("disk_id")) == norm_wid:
+                            target_vol = vol
+                            break
+
+                if target_vol is not None:
+                    target_vol.update(inherited)
+                else:
+                    volumes_info.append(inherited)
+                updated = True
+
+            if updated:
+                seen_disk_ids = set()
+                deduped = []
+                for vol in volumes_info:
+                    did = utils.normalized_volume_disk_path_key(
+                        vol.get("disk_id"))
+                    if did is not None and did in seen_disk_ids:
+                        LOG.warning(
+                            "Removing duplicate volumes_info entry for "
+                            "disk_id '%s' on instance '%s'.",
+                            vol.get("disk_id"), instance_id)
+                        continue
+                    if did is not None:
+                        seen_disk_ids.add(did)
+                    deduped.append(vol)
+                volumes_info = deduped
+
+                LOG.info(
+                    "Pre-set shared disk volumes_info for instance '%s' "
+                    "to skip replication of shared disks owned by other "
+                    "instances.", instance_id)
+                db_api.update_transfer_action_info_for_instance(
+                    ctxt, execution.action_id, instance_id,
+                    {"volumes_info": volumes_info})
+
+        # Re-read from DB so that volumes_info saved by the waiter loop above
+        # (which works on a local copy) is visible to the promotion sections.
+        action = db_api.get_action(
+            ctxt, execution.action_id, include_task_info=True)
+
+        for owner_id in set(owners.values()):
+            owner_volumes = action.info.get(owner_id, {}).get(
+                "volumes_info", [])
+            owner_updated = False
+            for vol in owner_volumes:
+                vol_key = utils.cluster_disk_identity(vol)
+                if not vol_key or owners.get(vol_key) != owner_id:
+                    continue
+                if not vol.get("shareable"):
+                    vol["shareable"] = True
+                    owner_updated = True
+            if owner_updated:
+                db_api.update_transfer_action_info_for_instance(
+                    ctxt, execution.action_id, owner_id,
+                    {"volumes_info": owner_volumes})
+
+        for instance_id in action.instances:
+            disk_map = instance_disk_maps.get(instance_id, {})
+            volumes_info = action.info.get(instance_id, {}).get(
+                "volumes_info", [])
+            if not volumes_info:
+                continue
+            promoted = False
+            for vol in volumes_info:
+                vol_key = utils.cluster_disk_identity(vol)
+                if not vol_key or vol_key not in shared_identities:
+                    continue
+                if vol_key not in disk_map:
+                    continue
+                if not vol.get("shareable"):
+                    vol["shareable"] = True
+                    promoted = True
+            if promoted:
+                LOG.info(
+                    "Ensured shareable=True on shared-disk volumes for "
+                    "instance '%s' before parallel minion attach.",
+                    instance_id)
+                db_api.update_transfer_action_info_for_instance(
+                    ctxt, execution.action_id, instance_id,
+                    {"volumes_info": volumes_info})
+
+    def _handle_task_sync_barrier(self, ctxt, task, execution, action):
+        """Implements a cross-instance sync barrier for clustered actions.
+
+        If the completed task's type is in TASK_TYPES_TO_SYNC and the
+        action is clustered, the task is set to SYNCING instead of
+        remaining COMPLETED. Once all instances' tasks of the same type
+        reach SYNCING, _handle_synced_tasks runs the type-specific sync
+        logic, then all tasks are set to COMPLETED and their execution
+        states are advanced.
+
+        Returns True if the barrier was activated (caller should return
+        early), False otherwise.
+        """
+        if task.task_type not in constants.TASK_TYPES_TO_SYNC:
+            return False
+        if not bool(getattr(action, "clustered", False)):
+            return False
+        if task.task_type == constants.TASK_TYPE_DEPLOY_TRANSFER_DISKS:
+            # Deploy tasks are ordered per instance (chained depends_on) so
+            # libvirt can reuse the owner volume. The barrier would
+            # set the first deploy to SYNCING; the next instance
+            # cannot start until the first is COMPLETED — deadlock.
+            # _setup_shared_disk_volumes_info already runs from
+            # task_completed after each deploy.
+            return False
+
+        db_api.set_task_status(
+            ctxt, task.id, constants.TASK_STATUS_SYNCING)
+
+        peer_tasks = [
+            t for t in execution.tasks
+            if t.task_type == task.task_type and t.id != task.id]
+        all_syncing = all(
+            t.status == constants.TASK_STATUS_SYNCING for t in peer_tasks)
+        if not all_syncing:
+            LOG.info(
+                "Task '%s' (type '%s') for instance '%s' is now SYNCING. "
+                "Waiting for peer tasks of other instances to reach SYNCING.",
+                task.id, task.task_type, task.instance)
+            return True
+
+        LOG.info(
+            "All tasks of type '%s' across all instances have reached "
+            "SYNCING for execution '%s'. Running sync handler.",
+            task.task_type, execution.id)
+
+        action = db_api.get_action(
+            ctxt, execution.action_id, include_task_info=True)
+        self._handle_synced_tasks(ctxt, task.task_type, execution, action)
+
+        synced_tasks = [task] + peer_tasks
+        for synced_task in synced_tasks:
+            db_api.set_task_status(
+                ctxt, synced_task.id, constants.TASK_STATUS_COMPLETED)
+
+        for synced_task in synced_tasks:
+            self._handle_post_task_actions(
+                ctxt, synced_task, execution,
+                action.info.get(synced_task.instance, {}))
+            self._advance_execution_state(
+                ctxt, execution, instance=synced_task.instance, requery=True)
+
+        return True
+
+    def _handle_synced_tasks(self, ctxt, task_type, execution, action):
+        """Runs type-specific logic after all instances reach a sync barrier.
+
+        Called once all tasks of a given type across all instances have
+        reached SYNCING. The handler can inspect and modify action info
+        (e.g. volumes_info) for all instances.
+        """
+        if task_type == constants.TASK_TYPE_GET_INSTANCE_INFO:
+            self._promote_clustered_shared_disk_shareable_in_export_info(
+                ctxt, execution)
+        elif task_type == constants.TASK_TYPE_DEPLOY_TRANSFER_DISKS:
+            self._setup_shared_disk_volumes_info(ctxt, execution)
+        elif task_type == constants.TASK_TYPE_SHUTDOWN_INSTANCE:
+            LOG.info(
+                "All instances have been shut down for clustered execution "
+                "'%s'. No additional sync handling required for shutdown.",
+                execution.id)
 
     def _handle_post_task_actions(self, ctxt, task, execution, task_info):
         task_type = task.task_type
@@ -3098,11 +3478,35 @@ class ConductorServerEndpoint(object):
 
             # NOTE: refresh the execution just in case:
             execution = db_api.get_tasks_execution(ctxt, task.execution_id)
+
+            # Copy owner's libvirt / replicate flags to waiters as soon as the
+            # owner finishes DEPLOY, before the next instance's deploy runs.
+            if (
+                    task_result
+                    and task.task_type == (
+                        constants.TASK_TYPE_DEPLOY_TRANSFER_DISKS)
+                    and getattr(action, "clustered", False)):
+                self._setup_shared_disk_volumes_info(ctxt, execution)
+
+            if self._handle_task_sync_barrier(
+                    ctxt, task, execution, action):
+                return
+
             self._handle_post_task_actions(
                 ctxt, task, execution, updated_task_info)
 
-            newly_started_tasks = self._advance_execution_state(
-                ctxt, execution, instance=task.instance, requery=False)
+            # Clustered transfers use cross-instance depends_on
+            # (chained deploy, peer deploy before replicate).
+            # Advancing only task.instance leaves peer instances'
+            # SCHEDULED work unconsidered when the peer is the
+            # one that must run next (e.g. second instance's deploy after the
+            # first's deploy completes).
+            if getattr(action, "clustered", False):
+                newly_started_tasks = self._advance_execution_state(
+                    ctxt, execution, requery=False)
+            else:
+                newly_started_tasks = self._advance_execution_state(
+                    ctxt, execution, instance=task.instance, requery=False)
             if newly_started_tasks:
                 LOG.info(
                     "The following tasks were started for execution '%s' "
@@ -3328,8 +3732,12 @@ class ConductorServerEndpoint(object):
                         "Some tasks are running in parallel with the "
                         "OSMorphing task, a debug setup cannot be safely "
                         "achieved. Proceeding with cleanup tasks as usual.")
+                    self._abort_peer_sync_barrier_tasks_on_error(
+                        ctxt, execution, task, exception_details)
                     self._cancel_tasks_execution(ctxt, execution)
             else:
+                self._abort_peer_sync_barrier_tasks_on_error(
+                    ctxt, execution, task, exception_details)
                 self._cancel_tasks_execution(ctxt, execution)
 
     @task_synchronized

@@ -662,6 +662,7 @@ def update_transfer_action_info_for_instance(
     """ Updates the info for the given action with the provided dict.
     Returns the updated value.
     Sub-fields of the dict already in the info will get overwritten entirely!
+    After merging, volumes_info is updated so it stays aligned with export_info
     """
     action = get_action(context, action_id, include_task_info=True)
     if not new_instance_info:
@@ -694,6 +695,7 @@ def update_transfer_action_info_for_instance(
 
     instance_info_old_copy = instance_info_old.copy()
     instance_info_old_copy.update(new_instance_info)
+    utils.sync_instance_volumes_with_export(instance_info_old_copy)
     action_info[instance] = instance_info_old_copy
     action.info = action_info
 

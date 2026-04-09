@@ -196,6 +196,90 @@ def retry_on_error(max_attempts=5, sleep_seconds=1,
     return _retry_on_error
 
 
+def normalized_volume_disk_path_key(disk_id):
+    """Lowercase/stripped path/string key for comparing disk identifiers."""
+    if disk_id is None:
+        return None
+    s = str(disk_id).strip().lower()
+    return s if s else None
+
+
+def cluster_disk_identity(disk_id_or_obj):
+    """Return a stable key for matching the same disk across cluster nodes.
+
+    The provider is expected to return a ``disk_id`` (or ``id`` on export
+    ``devices.disks`` entries) that is identical across all instances that
+    share the disk. For example, the VMware provider canonicalises the
+    datastore path of a multi-writer VMDK so every guest reports the same
+    string. Core just normalizes that value here for case-insensitive
+    comparison.
+    """
+    if isinstance(disk_id_or_obj, dict):
+        disk_id = disk_id_or_obj.get("disk_id")
+        if disk_id is None:
+            disk_id = disk_id_or_obj.get("id")
+        return normalized_volume_disk_path_key(disk_id)
+    return normalized_volume_disk_path_key(disk_id_or_obj)
+
+
+def ensure_volumes_info_volume_dev_default(volumes_info):
+    """Ensure each volume row has a ``volume_dev`` string for schema validation
+
+    Use ``""`` when the minion has not attached the volume yet (e.g. non-owner
+    shared-disk waiters) or the provider did not set the field.
+    """
+    if not volumes_info:
+        return
+    for vol in volumes_info:
+        if not isinstance(vol, dict):
+            continue
+        if "volume_dev" not in vol:
+            vol["volume_dev"] = ""
+
+
+def sync_instance_volumes_with_export(instance_info):
+    """Fill in volume list fields that should follow export_info.
+
+    Sets default ``volume_dev`` when missing, and copies the ``shareable``
+    flag from ``export_info['devices']['disks']`` onto each
+    ``volumes_info`` entry where it applies. Safe to call more than once.
+
+    Invoked from ``update_transfer_action_info_for_instance`` after merging
+    new instance info, and in the conductor right before it sends
+    ``task_info`` to a worker, so the DB and RPC payload stay aligned.
+    """
+    if not isinstance(instance_info, dict):
+        return
+    vols = instance_info.get("volumes_info")
+    if vols is None:
+        return
+    ensure_volumes_info_volume_dev_default(vols)
+    export = instance_info.get("export_info")
+    if not export:
+        return
+    apply_export_disk_shareable_metadata_to_volumes_info(export, vols)
+
+
+def apply_export_disk_shareable_metadata_to_volumes_info(
+        export_info, volumes_info):
+    """Propagate shareable from export_info disks to volumes_info entries."""
+    if not export_info or not volumes_info:
+        return
+    disks = export_info.get("devices", {}).get("disks") or []
+    share_idents = set()
+    for d in disks:
+        if d.get("shareable"):
+            cid = cluster_disk_identity(d)
+            if cid:
+                share_idents.add(cid)
+    if not share_idents:
+        return
+    for vol in volumes_info:
+        cid = cluster_disk_identity(vol)
+        if cid and cid in share_idents:
+            vol["shareable"] = True
+
+
 def get_udev_net_rules(net_ifaces_info):
     content = ""
     for name, mac_address in net_ifaces_info.items():
