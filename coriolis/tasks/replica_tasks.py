@@ -298,6 +298,11 @@ class ReplicateDisksTask(base.TaskRunner):
         source_environment = task_info['source_environment']
 
         source_resources = task_info.get('source_resources', {})
+        # NOTE: the full volumes_info list is passed to the provider,
+        # including any entries with 'replicate_disk_data' set to False
+        # (e.g. shared disks of clustered transfers whose data is
+        # replicated by their owner instance's task). It is up to each
+        # provider to skip replicating data for such volumes.
         volumes_info = provider.replicate_disks(
             ctxt, connection_info, source_environment, instance,
             source_resources, migr_source_conn_info, migr_target_conn_info,
