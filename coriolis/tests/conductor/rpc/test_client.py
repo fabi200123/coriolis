@@ -291,8 +291,7 @@ class ConductorClientTestCase(test_base.CoriolisRPCClientTestCase):
             "new_total_steps": None,
             "new_message": None
         }
-        self._test(self.client.update_task_progress_update, args,
-                   rpc_op='_cast')
+        self._test(self.client.update_task_progress_update, args)
 
     def test_create_transfer_schedule(self):
         args = {

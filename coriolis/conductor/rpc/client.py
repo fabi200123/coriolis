@@ -294,7 +294,10 @@ class ConductorClient(rpc.BaseRPCClient):
     def update_task_progress_update(
             self, ctxt, task_id, progress_update_index, new_current_step,
             new_total_steps=None, new_message=None):
-        self._cast(
+        # Must use synchronous RPC: EventManager advances last_perc only after
+        # this returns; fire-and-forget can lose the final update while state
+        # has already moved on, preventing any retry.
+        return self._call(
             ctxt, 'update_task_progress_update', task_id=task_id,
             progress_update_index=progress_update_index,
             new_current_step=new_current_step,
