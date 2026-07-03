@@ -74,6 +74,60 @@ def _check_ensure_volumes_info_ordering(export_info, volumes_info):
     return ordered_volumes_info
 
 
+def _update_legacy_disk_ids_in_volumes_info(export_info, volumes_info):
+    """Migrates volumes_info entries keyed on legacy disk identifiers.
+
+    Source providers may change their disk identification methodology
+    over time (e.g. the VMware provider moving from per-VM device keys
+    to virtual disk UUIDs). Replicas created before such a change have
+    volumes_info entries whose 'disk_id' no longer matches any disk 'id'
+    in a freshly-fetched export_info, which would lead the destination
+    provider to consider the existing volumes orphaned (deleting them)
+    and to create brand new ones.
+
+    To allow safely updating such replicas, each export_info disk may
+    declare the identifiers it was previously reported under via its
+    'legacy_ids' field. Any volumes_info entry whose 'disk_id' does not
+    match a current disk 'id' but does match a legacy one is updated
+    in-place to the current 'id'.
+    """
+    disks = export_info.get('devices', {}).get('disks', [])
+    current_ids = {str(d['id']) for d in disks if d.get('id')}
+    legacy_ids_map = {}
+    for disk in disks:
+        disk_id = disk.get('id')
+        if not disk_id:
+            continue
+        for legacy_id in disk.get('legacy_ids') or []:
+            legacy_ids_map[str(legacy_id)] = str(disk_id)
+
+    existing_volume_disk_ids = {
+        str(v.get('disk_id')) for v in volumes_info}
+    for volume_info in volumes_info:
+        disk_id = str(volume_info.get('disk_id'))
+        if disk_id in current_ids:
+            continue
+        new_disk_id = legacy_ids_map.get(disk_id)
+        if not new_disk_id:
+            continue
+        if new_disk_id in existing_volume_disk_ids:
+            # Migrating would duplicate an already-present entry; leave
+            # the legacy-keyed one for the destination provider to clean
+            # up as an orphaned volume instead.
+            LOG.warning(
+                "Not migrating volumes_info entry with legacy disk_id "
+                "'%s' to '%s': an entry with the new id already exists.",
+                disk_id, new_disk_id)
+            continue
+        LOG.info(
+            "Migrating volumes_info entry from legacy disk_id '%s' to "
+            "'%s'.", disk_id, new_disk_id)
+        volume_info['disk_id'] = new_disk_id
+        existing_volume_disk_ids.add(new_disk_id)
+
+    return volumes_info
+
+
 def _preserve_old_export_info_nic_ips(old_export_info, new_export_info):
     def _get_nic(nics_info, nic_id):
         for nic_info in nics_info:
@@ -291,6 +345,12 @@ class DeployReplicaDisksTask(base.TaskRunner):
         connection_info = base.get_connection_info(ctxt, destination)
 
         volumes_info = task_info.get("volumes_info", [])
+        # NOTE: migrate any volumes_info entries of pre-existing replicas
+        # which are still keyed on a legacy disk identifier (e.g. VMware
+        # device keys before the switch to virtual disk UUIDs) before the
+        # provider matches them against the current export_info disk ids:
+        _update_legacy_disk_ids_in_volumes_info(export_info, volumes_info)
+
         volumes_info = provider.deploy_replica_disks(
             ctxt, connection_info, target_environment, instance, export_info,
             volumes_info)
