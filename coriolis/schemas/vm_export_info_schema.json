@@ -118,6 +118,13 @@
                 "type": "string",
                 "description": "The allocation scheme for the given disk (static = thick; dynamic = thin)",
                 "enum": ["static", "dynamic"]
+              },
+              "legacy_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Identifiers which previous versions of the source provider may have reported as this disk's 'id' (e.g. the VMware provider moving from per-VM device keys to virtual disk UUIDs). Used to migrate the 'disk_id' fields of pre-existing replicas' volumes_info to the current identifier."
               }
             },
             "required": [
