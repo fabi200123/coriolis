@@ -527,14 +527,16 @@ class BaseWindowsMorphingToolsTestCase(test_base.CoriolisBaseTestCase):
             "debug = true\r\n"
             "san_policy = OnlineAll\r\n"
             "metadata_services = %(metadata_services)s\r\n"
-            "logging_serial_port_settings = %(com_port)s,9600,N,8\r\n" %
+            "logging_serial_port_settings = %(com_port)s,9600,N,8\r\n"
+            "real_time_clock_utc = %(real_time_clock_utc)s\r\n" %
             {"bin_path": "%s\\Bin" % local_base_dir,
              "log_path": "%s\\Log" % local_base_dir,
              "scripts_path": "%s\\LocalScripts" % local_base_dir,
              "com_port": 'COM1',
              "metadata_services": ",".join(
                  windows.CLOUDBASE_INIT_DEFAULT_METADATA_SVCS),
-             "plugins": ",".join(windows.CLOUDBASE_INIT_DEFAULT_PLUGINS)})
+             "plugins": ",".join(windows.CLOUDBASE_INIT_DEFAULT_PLUGINS),
+             "real_time_clock_utc": False})
 
         mock_write_winrm_file.assert_called_once_with(
             self.conn, conf_file_path, conf_content)
@@ -604,7 +606,8 @@ class BaseWindowsMorphingToolsTestCase(test_base.CoriolisBaseTestCase):
 
         mock_write_cloudbase_init_conf.assert_called_once_with(
             cloudbaseinit_base_dir, local_base_dir,
-            metadata_services=None, plugins=None, com_port='COM1')
+            metadata_services=None, plugins=None, com_port='COM1',
+            real_time_clock_utc=False)
         mock_check_cloudbase_init_exists.assert_called_once_with(
             str(mock_uuid4.return_value))
 
@@ -678,7 +681,8 @@ class BaseWindowsMorphingToolsTestCase(test_base.CoriolisBaseTestCase):
 
         mock_write_cloudbase_init_conf.assert_called_once_with(
             cloudbaseinit_base_dir, local_base_dir,
-            metadata_services=None, plugins=None, com_port='COM1')
+            metadata_services=None, plugins=None, com_port='COM1',
+            real_time_clock_utc=False)
         mock_setup_existing_cbslinit_service.assert_called_once_with(
             str(mock_uuid4.return_value), expected_image_path)
         mock_create_service.assert_not_called()
