@@ -498,7 +498,8 @@ class BaseWindowsMorphingTools(base.BaseOSMorphingTools):
 
     def _write_cloudbase_init_conf(self, cloudbaseinit_base_dir,
                                    local_base_dir, com_port="COM1",
-                                   metadata_services=None, plugins=None):
+                                   metadata_services=None, plugins=None,
+                                   real_time_clock_utc: bool = False):
         if metadata_services is None:
             metadata_services = CLOUDBASE_INIT_DEFAULT_METADATA_SVCS
 
@@ -537,13 +538,15 @@ class BaseWindowsMorphingTools(base.BaseOSMorphingTools):
             "debug = true\r\n"
             "san_policy = OnlineAll\r\n"
             "metadata_services = %(metadata_services)s\r\n"
-            "logging_serial_port_settings = %(com_port)s,9600,N,8\r\n" %
+            "logging_serial_port_settings = %(com_port)s,9600,N,8\r\n"
+            "real_time_clock_utc = %(real_time_clock_utc)s\r\n" %
             {"bin_path": "%s\\Bin" % local_base_dir,
              "log_path": "%s\\Log" % local_base_dir,
              "scripts_path": "%s\\LocalScripts" % local_base_dir,
              "com_port": com_port,
              "metadata_services": ",".join(metadata_services),
-             "plugins": ",".join(plugins)})
+             "plugins": ",".join(plugins),
+             "real_time_clock_utc": real_time_clock_utc})
 
         utils.write_winrm_file(
             self._conn,
@@ -560,7 +563,8 @@ class BaseWindowsMorphingTools(base.BaseOSMorphingTools):
 
     def _install_cloudbase_init(self, download_url,
                                 metadata_services=None, enabled_plugins=None,
-                                com_port="COM1"):
+                                com_port="COM1",
+                                real_time_clock_utc: bool = False):
         self._event_manager.progress_update("Adding cloudbase-init")
         cloudbaseinit_base_dir = self._get_cbslinit_base_dir()
 
@@ -589,7 +593,8 @@ class BaseWindowsMorphingTools(base.BaseOSMorphingTools):
             self._write_cloudbase_init_conf(
                 cloudbaseinit_base_dir, local_base_dir,
                 metadata_services=metadata_services,
-                plugins=enabled_plugins, com_port=com_port)
+                plugins=enabled_plugins, com_port=com_port,
+                real_time_clock_utc=real_time_clock_utc)
 
             image_path = (
                 '"%(path)s\\Bin\\OpenStackService.exe" cloudbase-init '
