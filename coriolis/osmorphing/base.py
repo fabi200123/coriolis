@@ -1121,6 +1121,15 @@ class BaseLinuxOSMorphingTools(BaseOSMorphingTools):
                     break
                 if ip_addresses and nic_ips:
                     if set(ip_addresses) & set(nic_ips):
+                        # ens192:SAB is an address label. The udev NAME has to
+                        # be the parent device, which has no ':' in its name.
+                        if ":" in iface:
+                            LOG.info(
+                                "Skipping IP alias interface '%s' for the "
+                                "udev rule.",
+                                iface,
+                            )
+                            continue
                         LOG.info(
                             "Found matching interface for NIC '%s' "
                             "with new MAC '%s', identified by IP.",
